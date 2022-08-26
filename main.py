@@ -19,6 +19,7 @@ import openai
 from dotenv import load_dotenv
 load_dotenv()
 
+OPENAITOKEN = os.environ.get("OPENAITOKEN")
 TOKEN = os.environ.get("TOKEN")
 intents = discord.Intents.default()
 intents.members = True
@@ -317,7 +318,7 @@ async def generaterandom(ctx):
         try:
             gods_word = await generate_text(db,guild)
         except:
-            await ctx.send("Oopsies!!!! I selected a server im not in anymore because im fucking stupid!!! OwO. Try again cumguzzler")
+            await ctx.send("Oopsies!!!! I selected a server im not in anymore!!")
             return
         if gods_choice <= 80:
             print(f"SENDING \"{gods_word}\" TO \"{ctx.channel.name}\" IN \"{ctx.guild.name}\".")
@@ -768,7 +769,7 @@ async def clearss(ctx):
         await db.commit()
     await ctx.send(f"Cleared the Secret Santa list!")
 
-openai.api_key = "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"
+openai.api_key = OPENAITOKEN
 @client.command(aliases=["p"])
 async def prompt(ctx,*,pro):
     response = openai.Completion.create(
