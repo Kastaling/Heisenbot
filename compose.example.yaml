@@ -1,0 +1,22 @@
+services:
+  heisenbot:
+    build: .
+    init: true
+    restart: unless-stopped
+    env_file: .env
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    volumes:
+      - ./database:/app/database
+      - ./media:/app/media
+      - ./logs:/app/logs
+      - ./cache:/home/heisenbot/.cache
+    networks:
+      - heisenbot
+
+networks:
+  heisenbot:
+    name: heisenbot

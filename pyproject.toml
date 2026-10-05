@@ -1,0 +1,20 @@
+[project]
+name = "heisenbot"
+version = "2.0.0"
+description = "A self-hosted Discord chatbot with Ollama-backed RAG and media memory"
+requires-python = ">=3.12,<3.15"
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+asyncio_mode = "auto"
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+exclude = ["database", "media", "logs", "cache"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "S"]
+ignore = ["E501", "S101", "S311", "S603", "S607"]

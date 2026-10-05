@@ -1,0 +1,15 @@
+.env
+.git
+.github
+.pytest_cache
+.ruff_cache
+__pycache__
+*.py[cod]
+*.db
+*.db-*
+cache
+database
+logs
+media
+tests
+Untitled
