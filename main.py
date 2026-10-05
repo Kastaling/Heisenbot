@@ -1851,6 +1851,14 @@ def _safe_extension(filename: str) -> bool:
     return Path(filename).suffix.lower() in SAFE_EXTENSIONS
 
 
+def _url_for_log(url: str) -> str:
+    """Describe a URL without leaking query strings, credentials, or signed tokens."""
+    parsed = urlsplit(url)
+    host = parsed.hostname or "unknown-host"
+    name = sanitize_filename(Path(parsed.path).name, fallback="media")
+    return f"{host}/{name}"
+
+
 def _content_addressed_media_path(dest: Path, filename: str, data: bytes) -> Path:
     digest = hashlib.sha256(data).hexdigest()
     suffix = Path(filename).suffix.lower()
@@ -1863,7 +1871,7 @@ async def _download_bytes(url: str) -> tuple[bytes, str, str] | None:
     session = await get_http_session()
     for _ in range(4):
         if not await validate_public_http_url(current_url):
-            log(f"[DOWNLOAD] Blocked unsafe URL: {current_url[:80]}")
+            log(f"[DOWNLOAD] Blocked unsafe URL: {_url_for_log(current_url)}")
             return None
         async with session.get(current_url, allow_redirects=False) as resp:
             if resp.status in {301, 302, 303, 307, 308}:
@@ -2002,7 +2010,7 @@ async def download_url(
                 await f.write(data)
         return path
     except Exception as e:
-        log(f"[DOWNLOAD] Failed to download URL {url[:80]}: {e}")
+        log(f"[DOWNLOAD] Failed to download URL {_url_for_log(url)}: {e}")
         return None
 
 
@@ -2179,7 +2187,11 @@ async def on_message(message: discord.Message):
             if saved:
                 saved_media.append(saved)
                 log_message(
-                    channel_name, guild_name, author_name, "", extra=f"DOWNLOADED URL: {url[:60]}"
+                    channel_name,
+                    guild_name,
+                    author_name,
+                    "",
+                    extra=f"DOWNLOADED URL: {_url_for_log(url)}",
                 )
 
         text = content_text.strip()
