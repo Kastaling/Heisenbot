@@ -146,7 +146,10 @@ def _save_guild_perms(guild_id: int) -> None:
     data = _guild_perms_cache.get(guild_id, {})
     try:
         fp = _perms_file(guild_id)
-        fp.write_text(json.dumps(data, indent=2))
+        temp_fp = fp.with_suffix(".json.tmp")
+        temp_fp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.chmod(temp_fp, 0o600)
+        os.replace(temp_fp, fp)
     except OSError as e:
         log(f"[PERMS] Failed to save perms for guild {guild_id}: {e}")
 
@@ -160,6 +163,13 @@ def channel_allowed(guild_id: int, channel_id: int, perm: str) -> bool:
         return ch.get(perm, True)
     except Exception:
         return True
+
+
+def _policy_channel_id(channel: discord.abc.Messageable) -> int:
+    """Threads inherit the bot policy configured for their parent channel."""
+    if isinstance(channel, discord.Thread) and channel.parent_id is not None:
+        return channel.parent_id
+    return channel.id
 
 
 def set_channel_perm(guild_id: int, channel_id: int, perm: str, allowed: bool) -> None:
@@ -581,6 +591,7 @@ VISUAL_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".webm", ".mov", ".avi", ".mkv"}
 
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+MEME_CONTEXT_MAX_CHARS = 6_000
 
 _FACT_PATTERNS = re.compile(
     r"\d{4}"
@@ -1009,11 +1020,28 @@ def find_media_for_query(guild_id: int, query: str) -> Path | None:
     """Find the best matching media file for a description query."""
     results = _search_media(guild_id, query, n_results=3)
     for meta in results:
-        fp = meta.get("file_path", "")
-        p = Path(fp)
-        if p.exists():
+        p = _resolve_guild_media_path(guild_id, meta.get("file_path", ""))
+        if p is not None:
             return p
     return None
+
+
+def _resolve_guild_media_path(guild_id: int, raw_path: object) -> Path | None:
+    """Resolve a stored media path only when it is a safe file for this guild."""
+    if not isinstance(raw_path, str) or not raw_path:
+        return None
+    try:
+        base = (MEDIA_BASE / str(guild_id)).resolve()
+        candidate = Path(raw_path).resolve()
+        if not candidate.is_relative_to(base):
+            return None
+        if not candidate.is_file() or not _safe_extension(candidate.name):
+            return None
+        if candidate.stat().st_size > MAX_ATTACHMENT_BYTES:
+            return None
+        return candidate
+    except (OSError, RuntimeError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -2055,6 +2083,7 @@ bot = Heisenbot(
     command_prefix=COMMAND_PREFIX,
     intents=intents,
     owner_id=int(OWNER_ID) if OWNER_ID else None,
+    allowed_mentions=discord.AllowedMentions.none(),
 )
 
 
@@ -2082,6 +2111,15 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, (commands.BadArgument, commands.MissingRequiredArgument)):
         await ctx.send(f"Invalid command arguments: {error}")
         return
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(f"That command is cooling down. Try again in {error.retry_after:.1f}s.")
+        return
+    if isinstance(error, commands.MaxConcurrencyReached):
+        await ctx.send("That command is already running here. Wait for it to finish.")
+        return
+    if isinstance(error, commands.NoPrivateMessage):
+        await ctx.send("That command can only be used in a server.")
+        return
     log(f"[COMMAND] {getattr(ctx.command, 'qualified_name', 'unknown')} failed: {error}")
     await ctx.send("That command failed. Check the bot logs for details.")
 
@@ -2102,7 +2140,7 @@ async def on_message(message: discord.Message):
         return
 
     guild_id = message.guild.id
-    chan_id = message.channel.id
+    chan_id = _policy_channel_id(message.channel)
 
     # Bot commands bypass the entire LLM pipeline — dispatch if commands perm allows
     prefixes = (
@@ -2519,6 +2557,7 @@ async def invite_cmd(ctx: commands.Context):
         return
     perms = discord.Permissions(
         send_messages=True,
+        send_messages_in_threads=True,
         read_messages=True,
         read_message_history=True,
         attach_files=True,
@@ -2823,6 +2862,8 @@ def _ttt_build_view(
 
 
 @bot.command(name="tictactoe", aliases=["ttt"])
+@commands.cooldown(1, 5, commands.BucketType.user)
+@commands.max_concurrency(1, per=commands.BucketType.channel, wait=False)
 async def tictactoe_cmd(ctx: commands.Context, user_marker: str = "", bot_marker: str = ""):
     """Start a button-based tic-tac-toe game. Optional: ..tictactoe [your_marker] [bot_marker] (default X vs O).
     Use ..tictactoe botfirst to let Heisenbot go first. One game per channel; starting again replaces the current game.
@@ -2837,6 +2878,18 @@ async def tictactoe_cmd(ctx: commands.Context, user_marker: str = "", bot_marker
         await ctx.send("Your marker and Heisenbot's marker must be different.")
         return
     channel_id = ctx.channel.id
+    active_game = next(
+        (
+            game
+            for (game_channel_id, _), game in _ttt_games.items()
+            if game_channel_id == channel_id and not _ttt_is_expired(game)
+        ),
+        None,
+    )
+    if active_game and active_game.get("human_id") != ctx.author.id:
+        active_name = discord.utils.escape_markdown(active_game.get("human_name", "another player"))
+        await ctx.send(f"{active_name} already has an active game in this channel.")
+        return
     # Replace any existing game(s) in this channel so only this message is active
     _ttt_clear_channel(channel_id)
     now = time.monotonic()
@@ -2905,8 +2958,8 @@ async def tictactoe_cmd(ctx: commands.Context, user_marker: str = "", bot_marker
 @bot.command(name="context", aliases=["ctx"])
 async def show_context(ctx: commands.Context):
     """Show the full prompt context from the last bot reply in this channel."""
-    if not _is_admin(ctx):
-        await ctx.send("You need server management permissions to use this.")
+    if not _is_owner(ctx):
+        await ctx.send("Only the bot owner can inspect raw prompt context.")
         return
     data = _LAST_CONTEXT.get(ctx.channel.id)
     if not data:
@@ -2924,6 +2977,7 @@ async def show_context(ctx: commands.Context):
             return f"\n__**{title}**__\n*(empty)*"
         if len(val) > limit:
             val = val[:limit] + f"\n... ({len(data.get(key, ''))} chars total)"
+        val = val.replace("```", "``\u200b`")
         return f"\n__**{title}**__\n```\n{val}\n```"
 
     sections.append(_section("User Prompt", "prompt", 400))
@@ -3028,6 +3082,8 @@ def _build_stats_embed(
         breakdown = "  ".join(
             f"**{ext}:** {_format_number(n)}" for ext, n in media_breakdown.items()
         )
+        if len(breakdown) > 1024:
+            breakdown = breakdown[:1021] + "..."
         em.add_field(name="Media Breakdown", value=breakdown, inline=False)
     else:
         em.add_field(name="Media Breakdown", value="*No media files found*", inline=False)
@@ -3061,8 +3117,11 @@ async def stats_cmd(ctx: commands.Context, *, timespan: str = ""):
 
     # Guild-specific stats
     guild_id = ctx.guild.id if ctx.guild else 0
-    guild_counts = _stats_query(guild_id=guild_id, since=since)
-    guild_media_total, guild_media_bd = _media_stats_from_disk(guild_id=guild_id)
+    guild_counts, guild_media_result = await asyncio.gather(
+        asyncio.to_thread(_stats_query, guild_id, since),
+        asyncio.to_thread(_media_stats_from_disk, guild_id),
+    )
+    guild_media_total, guild_media_bd = guild_media_result
     guild_embed = _build_stats_embed(
         title=f"Stats — {ctx.guild.name}" if ctx.guild else "Stats — DM",
         counts=guild_counts,
@@ -3072,26 +3131,33 @@ async def stats_cmd(ctx: commands.Context, *, timespan: str = ""):
         time_label=time_label,
     )
 
-    # Global stats (all guilds)
-    global_counts = _stats_query(guild_id=None, since=since)
-    global_media_total, global_media_bd = _media_stats_from_disk(guild_id=None)
-    global_embed = _build_stats_embed(
-        title="Stats — All Servers",
-        counts=global_counts,
-        media_total=global_media_total,
-        media_breakdown=global_media_bd,
-        color=0x2ECC71,
-        time_label=time_label,
-    )
+    embeds = [guild_embed]
+    if _is_owner(ctx):
+        # Cross-server data is owner-only; guild managers see only their guild.
+        global_counts, global_media_result = await asyncio.gather(
+            asyncio.to_thread(_stats_query, None, since),
+            asyncio.to_thread(_media_stats_from_disk, None),
+        )
+        global_media_total, global_media_bd = global_media_result
+        embeds.append(
+            _build_stats_embed(
+                title="Stats — All Servers",
+                counts=global_counts,
+                media_total=global_media_total,
+                media_breakdown=global_media_bd,
+                color=0x2ECC71,
+                time_label=time_label,
+            )
+        )
 
-    await ctx.send(embeds=[guild_embed, global_embed])
+    await ctx.send(embeds=embeds)
 
 
 @bot.command(name="leaderboard", aliases=["lb"])
 async def leaderboard_cmd(ctx: commands.Context, *, timespan: str = ""):
     """Show a ranked leaderboard of all servers. Optional time filter: ..lb 7d"""
-    if not _is_admin(ctx):
-        await ctx.send("You need server management permissions to use this.")
+    if not _is_owner(ctx):
+        await ctx.send("Only the bot owner can view cross-server statistics.")
         return
 
     since: datetime | None = None
@@ -3109,7 +3175,7 @@ async def leaderboard_cmd(ctx: commands.Context, *, timespan: str = ""):
         unit_names = {"m": "min", "h": "hr", "d": "day", "w": "wk", "y": "yr"}
         time_label = "Last " + " ".join(f"{amt}{unit_names.get(u.lower(), u)}" for amt, u in parts)
 
-    per_guild = _stats_per_guild(since=since)
+    per_guild = await asyncio.to_thread(_stats_per_guild, since)
     if not per_guild:
         await ctx.send("No stats recorded yet.")
         return
@@ -3125,12 +3191,16 @@ async def leaderboard_cmd(ctx: commands.Context, *, timespan: str = ""):
     embeds: list[discord.Embed] = []
     medal = ["🥇", "🥈", "🥉"]
 
-    for rank, (gid, counts) in enumerate(ranked, 1):
+    media_results = await asyncio.gather(
+        *(asyncio.to_thread(_media_stats_from_disk, gid) for gid, _ in ranked)
+    )
+    for rank, ((gid, counts), (media_total, media_bd)) in enumerate(
+        zip(ranked, media_results, strict=True),
+        1,
+    ):
         guild_obj = bot.get_guild(gid)
         name = guild_obj.name if guild_obj else f"Guild {gid}"
         prefix = medal[rank - 1] if rank <= 3 else f"#{rank}"
-
-        media_total, media_bd = _media_stats_from_disk(guild_id=gid)
 
         em = _build_stats_embed(
             title=f"{prefix}  {name}",
@@ -3157,11 +3227,9 @@ async def leaderboard_cmd(ctx: commands.Context, *, timespan: str = ""):
 # Tracked word stats and leaderboard
 # ---------------------------------------------------------------------------
 @bot.command(name="wordstats", aliases=["ws"])
+@commands.guild_only()
 async def wordstats_cmd(ctx: commands.Context, *, member_str: str = ""):
     """Tracked word stats: server summary, or ..wordstats @user for that user's counts and favorite word."""
-    if not ctx.guild:
-        return
-
     guild_id = ctx.guild.id
 
     if member_str.strip():
@@ -3180,10 +3248,12 @@ async def wordstats_cmd(ctx: commands.Context, *, member_str: str = ""):
             return
         counts = await asyncio.to_thread(_user_word_counts, guild_id, member.id)
         if not counts:
-            await ctx.send(f"**{member.display_name}** hasn't said any tracked words yet.")
+            display_name = discord.utils.escape_markdown(member.display_name)
+            await ctx.send(f"**{display_name}** hasn't said any tracked words yet.")
             return
         favorite_word = max(counts.items(), key=lambda x: x[1])
-        lines = [f"**{member.display_name}** — Tracked word counts", ""]
+        display_name = discord.utils.escape_markdown(member.display_name)
+        lines = [f"**{display_name}** — Tracked word counts", ""]
         for word, count in sorted(counts.items(), key=lambda x: -x[1]):
             lines.append(f"**{word}:** {count:,}")
         lines.append("")
@@ -3196,7 +3266,7 @@ async def wordstats_cmd(ctx: commands.Context, *, member_str: str = ""):
     if not totals:
         await ctx.send("No tracked word data for this server yet.")
         return
-    popular = _most_popular_word_guild(guild_id)
+    popular = await asyncio.to_thread(_most_popular_word_guild, guild_id)
     lines = [
         f"**Tracked words — {ctx.guild.name}**",
         "",
@@ -3208,7 +3278,7 @@ async def wordstats_cmd(ctx: commands.Context, *, member_str: str = ""):
         if top1:
             uid = top1[0][0]
             member = ctx.guild.get_member(uid)
-            name = member.display_name if member else f"User {uid}"
+            name = discord.utils.escape_markdown(member.display_name) if member else f"User {uid}"
             line += f" — top: **{name}** ({top1[0][2]:,}×)"
         lines.append(line)
     lines.append("")
@@ -3218,11 +3288,9 @@ async def wordstats_cmd(ctx: commands.Context, *, member_str: str = ""):
 
 
 @bot.command(name="wordleaderboard", aliases=["wlb"])
+@commands.guild_only()
 async def wordleaderboard_cmd(ctx: commands.Context, *, word_key: str = ""):
     """Top 10 users by tracked word count. ..wordleaderboard [word] for a specific word, or all words combined."""
-    if not ctx.guild:
-        return
-
     guild_id = ctx.guild.id
     key = word_key.strip().lower() if word_key.strip() else None
     if key and not any(k == key for _, k in TRACKED_WORDS):
@@ -3243,7 +3311,7 @@ async def wordleaderboard_cmd(ctx: commands.Context, *, word_key: str = ""):
     lines = [f"**{title}** — {ctx.guild.name}", ""]
     for i, (uid, _, count) in enumerate(top, 1):
         member = ctx.guild.get_member(uid)
-        name = member.display_name if member else f"User {uid}"
+        name = discord.utils.escape_markdown(member.display_name) if member else f"User {uid}"
         lines.append(f"  {i}. **{name}** — {count:,}")
     await ctx.send("\n".join(lines))
 
@@ -3260,22 +3328,19 @@ def _is_owner(ctx: commands.Context) -> bool:
 
 
 def _is_admin(ctx: commands.Context) -> bool:
-    """Bot owner or guild member with relevant management permissions."""
+    """Bot owner or guild member trusted to configure the bot."""
     if _is_owner(ctx):
         return True
     perms = getattr(ctx.author, "guild_permissions", None)
     if perms is None:
         return False
-    return (
-        perms.administrator or perms.manage_channels or perms.manage_messages or perms.manage_guild
-    )
+    return perms.administrator or perms.manage_channels or perms.manage_guild
 
 
 @bot.command(name="channels", aliases=["perms"])
+@commands.guild_only()
 async def show_channels(ctx: commands.Context):
     """Display a permission chart for all text channels in this server."""
-    if not ctx.guild:
-        return
     if not _is_admin(ctx):
         await ctx.send("You need server management permissions to view this.")
         return
@@ -3322,31 +3387,50 @@ async def show_channels(ctx: commands.Context):
     )
     title = f"**Channel Permissions — {ctx.guild.name}**\n{status}"
 
-    body = f"```\n{chr(10).join(lines)}\n```"
-    body += (
+    legend = (
         "`Listen` = learn from messages & download media\n"
         "`Respond` = send AI replies (random + @mention)\n"
-        "`Cmds` = allow bot commands (..gc, ..gpu, etc.)\n"
+        f"`Cmds` = allow bot commands ({COMMAND_PREFIX}gc, {COMMAND_PREFIX}gpu, etc.)\n"
         "`*` = channel has custom overrides\n"
-        "All default to YES. Use `..channel` to change."
+        f"All default to YES. Use `{COMMAND_PREFIX}channel` to change."
     )
-    await send_long(ctx.channel, f"{title}\n{body}")
+    pages: list[list[str]] = []
+    current_page: list[str] = []
+    current_length = 0
+    for line in lines:
+        if current_page and current_length + len(line) + 1 > 1_350:
+            pages.append(current_page)
+            current_page = []
+            current_length = 0
+        current_page.append(line)
+        current_length += len(line) + 1
+    if current_page:
+        pages.append(current_page)
+
+    for page_number, page_lines in enumerate(pages, 1):
+        page_title = title if len(pages) == 1 else f"{title} — page {page_number}/{len(pages)}"
+        content = f"{page_title}\n```\n{chr(10).join(page_lines)}\n```"
+        if page_number == len(pages):
+            content += legend
+        await ctx.send(content)
 
 
 @bot.group(name="channel", aliases=["ch"], invoke_without_command=True)
+@commands.guild_only()
 async def channel_cmd(ctx: commands.Context):
     """Manage per-channel permissions. Use subcommands: allow, deny, reset, resetall."""
     await ctx.send(
         "**Usage:**\n"
-        "`..channel allow #channel <perm|all>` — enable a permission\n"
-        "`..channel deny #channel <perm|all>` — disable a permission\n"
-        "`..channel reset #channel` — reset channel to defaults\n"
-        "`..channel resetall` — reset ALL channels to defaults\n"
+        f"`{COMMAND_PREFIX}channel allow #channel <perm|all>` — enable a permission\n"
+        f"`{COMMAND_PREFIX}channel deny #channel <perm|all>` — disable a permission\n"
+        f"`{COMMAND_PREFIX}channel reset #channel` — reset channel to defaults\n"
+        f"`{COMMAND_PREFIX}channel resetall` — reset ALL channels to defaults\n"
         "Permissions: `listen`, `respond`, `commands`, `all`"
     )
 
 
 @channel_cmd.command(name="allow")
+@commands.guild_only()
 async def channel_allow(ctx: commands.Context, channel: discord.TextChannel, perm: str):
     """Enable a permission for a channel."""
     if not _is_admin(ctx):
@@ -3364,6 +3448,7 @@ async def channel_allow(ctx: commands.Context, channel: discord.TextChannel, per
 
 
 @channel_cmd.command(name="deny")
+@commands.guild_only()
 async def channel_deny(ctx: commands.Context, channel: discord.TextChannel, perm: str):
     """Disable a permission for a channel."""
     if not _is_admin(ctx):
@@ -3381,6 +3466,7 @@ async def channel_deny(ctx: commands.Context, channel: discord.TextChannel, perm
 
 
 @channel_cmd.command(name="reset")
+@commands.guild_only()
 async def channel_reset(ctx: commands.Context, channel: discord.TextChannel):
     """Reset a channel's permissions back to defaults (all allowed)."""
     if not _is_admin(ctx):
@@ -3391,6 +3477,7 @@ async def channel_reset(ctx: commands.Context, channel: discord.TextChannel):
 
 
 @channel_cmd.command(name="resetall")
+@commands.guild_only()
 async def channel_resetall(ctx: commands.Context):
     """Reset ALL channel permissions for this server back to defaults."""
     if not _is_admin(ctx):
@@ -3443,6 +3530,46 @@ def _parse_rage_args(
         member1 = random.choice(pool)
 
     return member1, member2, situation_str
+
+
+def _random_guild_background(guild_id: int) -> bytes | None:
+    """Load a bounded random image, or a video frame, from this guild only."""
+    guild_media_dir = MEDIA_BASE / str(guild_id)
+    try:
+        raw_candidates = list(guild_media_dir.iterdir()) if guild_media_dir.is_dir() else []
+        candidates = [
+            safe_path
+            for path in raw_candidates
+            if (safe_path := _resolve_guild_media_path(guild_id, str(path))) is not None
+        ]
+        images = [path for path in candidates if path.suffix.lower() in VISUAL_EXTENSIONS]
+        if images:
+            chosen = random.choice(images)
+            log(f"[MEME] Random bg from disk: {chosen.name}")
+            return chosen.read_bytes()
+
+        videos = [path for path in candidates if path.suffix.lower() in VIDEO_EXTENSIONS]
+        if videos:
+            import cv2
+
+            cap = cv2.VideoCapture(str(random.choice(videos)))
+            try:
+                ret, frame = cap.read()
+            finally:
+                cap.release()
+            if ret:
+                ok, encoded = cv2.imencode(".jpg", frame)
+                if ok:
+                    log("[MEME] Extracted video frame for bg")
+                    return encoded.tobytes()
+    except (OSError, RuntimeError, ValueError) as exc:
+        log(f"[MEME] Fallback bg failed: {exc}")
+    return None
+
+
+def _safe_output_stem(name: str, fallback: str) -> str:
+    """Return a short portable label for a generated Discord attachment."""
+    return Path(sanitize_filename(name, fallback=fallback)).stem[:48] or fallback
 
 
 async def _parse_meme_args(
@@ -3544,8 +3671,12 @@ async def _parse_meme_args(
             )
             if result:
                 pick = random.choice(result)
-                fp = Path(pick.get("file_path", ""))
-                if await asyncio.to_thread(fp.exists):
+                fp = await asyncio.to_thread(
+                    _resolve_guild_media_path,
+                    guild_id,
+                    pick.get("file_path", ""),
+                )
+                if fp is not None:
                     bg_bytes = await asyncio.to_thread(fp.read_bytes)
                 desc = pick.get("description", "")
                 if desc and not seed:
@@ -3566,48 +3697,21 @@ async def _parse_meme_args(
         except Exception as e:
             log(f"[MEME] ChromaDB query failed: {e}")
 
-    # Guarantee a background image from this guild's downloaded media
-    if bg_bytes is None:
-        try:
-            guild_media_dir = MEDIA_BASE / str(guild_id)
-            if guild_media_dir.is_dir():
-                img_files = [
-                    f
-                    for f in guild_media_dir.iterdir()
-                    if f.is_file() and f.suffix.lower() in VISUAL_EXTENSIONS
-                ]
-                if img_files:
-                    chosen = random.choice(img_files)
-                    bg_bytes = chosen.read_bytes()
-                    log(f"[MEME] Random bg from disk: {chosen.name}")
-                else:
-                    vid_files = [
-                        f
-                        for f in guild_media_dir.iterdir()
-                        if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS
-                    ]
-                    if vid_files:
-                        import cv2
+    user_context = user_context[:MEME_CONTEXT_MAX_CHARS]
 
-                        cap = cv2.VideoCapture(str(random.choice(vid_files)))
-                        ret, frame = cap.read()
-                        cap.release()
-                        if ret:
-                            _, enc = cv2.imencode(".jpg", frame)
-                            bg_bytes = enc.tobytes()
-                            log("[MEME] Extracted video frame for bg")
-        except Exception as e:
-            log(f"[MEME] Fallback bg failed: {e}")
+    # Guarantee a background image from this guild's downloaded media.
+    if bg_bytes is None:
+        bg_bytes = await asyncio.to_thread(_random_guild_background, guild_id)
 
     return target_name, target_member, seed, user_context, bg_bytes
 
 
 @bot.command(name="getcaptioned", aliases=["gc"])
+@commands.guild_only()
+@commands.cooldown(1, 30, commands.BucketType.user)
+@commands.max_concurrency(1, per=commands.BucketType.guild, wait=False)
 async def getcaptioned(ctx: commands.Context, *, args: str = ""):
     """Generate an Impact-font meme caption. Usage: ..gc [@user] ["seed phrase"]"""
-    if not ctx.guild:
-        return
-
     author_name = ctx.author.display_name
     channel_name = getattr(ctx.channel, "name", "dm")
     guild_name = getattr(ctx.guild, "name", "DM")
@@ -3627,18 +3731,19 @@ async def getcaptioned(ctx: commands.Context, *, args: str = ""):
     log(f"[MEME] Caption: {top} / {bottom}")
 
     buf = await asyncio.to_thread(_render_impact_meme, top, bottom, bg_bytes)
-    fname = f"meme_{target_name or 'random'}_{uuid.uuid4().hex[:6]}.png"
+    output_stem = _safe_output_stem(target_name, "random")
+    fname = f"meme_{output_stem}_{uuid.uuid4().hex[:6]}.png"
     await ctx.send(file=discord.File(buf, filename=fname))
     elapsed = time.monotonic() - meme_t0
     log(f"[MEME] Done in {elapsed:.1f}s for {author_name} in #{channel_name}")
 
 
 @bot.command(name="poster", aliases=["mp"])
+@commands.guild_only()
+@commands.cooldown(1, 30, commands.BucketType.user)
+@commands.max_concurrency(1, per=commands.BucketType.guild, wait=False)
 async def poster_cmd(ctx: commands.Context, *, args: str = ""):
     """Generate a demotivational poster. Usage: ..poster [@user] ["seed phrase"]"""
-    if not ctx.guild:
-        return
-
     author_name = ctx.author.display_name
     channel_name = getattr(ctx.channel, "name", "dm")
     guild_name = getattr(ctx.guild, "name", "DM")
@@ -3658,18 +3763,19 @@ async def poster_cmd(ctx: commands.Context, *, args: str = ""):
     log(f"[POSTER] Title: {title} / Caption: {caption}")
 
     buf = await asyncio.to_thread(_render_motivational_poster, title, caption, bg_bytes)
-    fname = f"poster_{target_name or 'random'}_{uuid.uuid4().hex[:6]}.png"
+    output_stem = _safe_output_stem(target_name, "random")
+    fname = f"poster_{output_stem}_{uuid.uuid4().hex[:6]}.png"
     await ctx.send(file=discord.File(buf, filename=fname))
     elapsed = time.monotonic() - poster_t0
     log(f"[POSTER] Done in {elapsed:.1f}s for {author_name} in #{channel_name}")
 
 
 @bot.command(name="rage", aliases=["ragecomic"])
+@commands.guild_only()
+@commands.cooldown(1, 45, commands.BucketType.user)
+@commands.max_concurrency(1, per=commands.BucketType.guild, wait=False)
 async def rage_cmd(ctx: commands.Context, *, args: str = ""):
     """Usage: ..rage [@user1] [@user2] ['situation']. If situation is omitted, the bot generates one from the two users' recent messages. If users are omitted, they are chosen at random."""
-    if not ctx.guild:
-        return
-
     author_name = ctx.author.display_name
     channel_name = getattr(ctx.channel, "name", "dm")
     guild_name = getattr(ctx.guild, "name", "DM")
@@ -3679,6 +3785,9 @@ async def rage_cmd(ctx: commands.Context, *, args: str = ""):
         await ctx.send(
             "Need at least 2 non-bot members in the server to pick from for a random comic."
         )
+        return
+    if member1.id == member2.id:
+        await ctx.send("Choose two different members for the comic.")
         return
 
     name1 = member1.display_name
@@ -3744,8 +3853,10 @@ async def rage_cmd(ctx: commands.Context, *, args: str = ""):
             log(f"[RAGE] Avatar download failed: {e}")
         return _rage_placeholder_avatar()
 
-    avatar1_bytes = await _fetch_avatar(member1.display_avatar.with_size(512).url)
-    avatar2_bytes = await _fetch_avatar(member2.display_avatar.with_size(512).url)
+    avatar1_bytes, avatar2_bytes = await asyncio.gather(
+        _fetch_avatar(member1.display_avatar.with_size(512).url),
+        _fetch_avatar(member2.display_avatar.with_size(512).url),
+    )
     if not avatar1_bytes or len(avatar1_bytes) < 100:
         avatar1_bytes = _rage_placeholder_avatar()
     if not avatar2_bytes or len(avatar2_bytes) < 100:
@@ -3762,8 +3873,8 @@ async def rage_cmd(ctx: commands.Context, *, args: str = ""):
         name1,
         name2,
     )
-    safe1 = re.sub(r"[^\w\-]", "", name1)[:20] or "u1"
-    safe2 = re.sub(r"[^\w\-]", "", name2)[:20] or "u2"
+    safe1 = _safe_output_stem(name1, "u1")[:20]
+    safe2 = _safe_output_stem(name2, "u2")[:20]
     fname = f"rage_{safe1}_{safe2}_{uuid.uuid4().hex[:6]}.png"
     await ctx.send(file=discord.File(buf, filename=fname))
     elapsed = time.monotonic() - rage_t0

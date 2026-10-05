@@ -13,14 +13,26 @@ _MULTIPLIERS = {
     "w": timedelta(weeks=1),
     "y": timedelta(days=365),
 }
+MAX_DURATION = timedelta(days=365 * 100)
 
 
 def parse_duration(text: str) -> timedelta | None:
-    """Parse a complete expression such as ``1h 30m``; reject partial junk."""
+    """Parse a complete expression such as ``1h 30m``; reject partial junk.
+
+    Durations are bounded so hostile input cannot trigger huge integer work or
+    overflow when the result is subtracted from a datetime.
+    """
     normalized = re.sub(r"\s+", "", text)
     if not normalized or not re.fullmatch(r"(?:\d+[mhdwy])+", normalized, re.IGNORECASE):
         return None
     total = timedelta()
     for amount, unit in DURATION_RE.findall(normalized):
-        total += int(amount) * _MULTIPLIERS[unit.lower()]
+        if len(amount) > 6:
+            return None
+        try:
+            total += int(amount) * _MULTIPLIERS[unit.lower()]
+        except OverflowError:
+            return None
+        if total > MAX_DURATION:
+            return None
     return total

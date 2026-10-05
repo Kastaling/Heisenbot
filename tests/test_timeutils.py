@@ -15,3 +15,8 @@ def test_parse_duration_rejects_partial_or_unknown_input():
     assert parse_duration("7d please") is None
     assert parse_duration("10s") is None
     assert parse_duration("") is None
+
+
+def test_parse_duration_rejects_excessive_values():
+    assert parse_duration("101y") is None
+    assert parse_duration("999999999999999999999999999999999999y") is None
