@@ -6,7 +6,7 @@ The current code replaces the repository's original Markov-chain prototype. Runt
 
 ## How it works
 
-1. A Discord message is accepted only when the guild/channel policy permits listening.
+1. Every message in every non-NSFW guild channel or thread visible to the bot is consumed by default. NSFW channels are never learned from, and administrators can explicitly disable listening in any additional channel.
 2. Text is upserted into a guild-specific ChromaDB collection. Media is downloaded with size, type, redirect, and public-network checks, then stored by content hash.
 3. When the bot is mentioned, replied to, or selected by the configured random reply chance, it retrieves related server memories and recent channel history.
 4. Ollama generates the response. Optional search and verification steps can add current public information.
@@ -53,7 +53,9 @@ Invalid numeric or boolean values fail fast at startup instead of silently choos
 
 ## Data and privacy
 
-By default, channel policy allows listening, responding, and commands so existing installations retain their behavior. Server administrators should explicitly disable learning anywhere messages should not be retained:
+By default, Heisenbot consumes content from every non-NSFW guild channel and thread it can see. NSFW channels are excluded from RAG ingestion, media downloads, and statistics. Automatic replies and reactions are attempted only where both Heisenbot's `respond` policy and Discord's effective channel permissions allow them. A direct bot command bypasses the random/mention reply decision, but it still requires the `commands` policy and Discord's send permission. Discord permissions can never be bypassed.
+
+Server administrators should explicitly disable learning anywhere messages should not be retained:
 
 ```text
 ..channel deny #private-channel listen

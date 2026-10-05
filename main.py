@@ -114,8 +114,9 @@ PERMS_DIR = Path(os.getenv("PERMS_DIR", "./database/permissions"))
 # ---------------------------------------------------------------------------
 # Per-guild channel permissions (JSON-backed)
 # ---------------------------------------------------------------------------
-# Permission flags per channel. All default to True (allowed) so existing
-# behaviour is preserved. Admins opt-out specific channels.
+# Permission flags per channel. Default policy: learn, respond, and accept
+# commands everywhere the Discord role permissions allow it. Admins can opt
+# individual channels out without changing the bot's Discord role.
 PERM_KEYS = ("listen", "respond", "commands")
 
 _guild_perms_cache: dict[int, dict[str, dict[str, bool]]] = {}
@@ -2065,6 +2066,10 @@ async def on_ready():
     log(
         f"[CONFIG] num_ctx={OLLAMA_NUM_CTX}  verifier_ctx={OLLAMA_VERIFIER_NUM_CTX}  cooldown={OLLAMA_COOLDOWN}s"
     )
+    log(
+        "[CONFIG] channel defaults: listen=yes, respond=yes, commands=yes; "
+        "Discord role/channel permissions remain authoritative"
+    )
     log(f"[CONFIG] guilds: {[g.name for g in bot.guilds]}")
 
 
@@ -2090,17 +2095,12 @@ async def on_message(message: discord.Message):
 
     log_message(channel_name, guild_name, author_name, message.content or "(no text)")
 
-    if getattr(message.channel, "is_nsfw", lambda: False)():
-        await bot.process_commands(message)
-        return
     if not message.guild:
         await bot.process_commands(message)
         return
 
     guild_id = message.guild.id
     chan_id = message.channel.id
-
-    await asyncio.to_thread(record_event, guild_id, "message_seen")
 
     # Bot commands bypass the entire LLM pipeline — dispatch if commands perm allows
     prefixes = (
@@ -2116,6 +2116,13 @@ async def on_message(message: discord.Message):
             log_debug(f"[PERMS] Commands blocked in #{channel_name}")
         return
 
+    # NSFW channels are a hard learning/output boundary. Explicit commands were
+    # handled above, subject to the commands policy and Discord permissions.
+    if getattr(message.channel, "is_nsfw", lambda: False)():
+        return
+
+    await asyncio.to_thread(record_event, guild_id, "message_seen")
+
     # Check listen permission (media download + RAG storage)
     can_listen = channel_allowed(guild_id, chan_id, "listen")
     # Check respond permission (LLM replies)
@@ -2123,9 +2130,19 @@ async def on_message(message: discord.Message):
     me = message.guild.me
     if can_respond and me is not None:
         discord_perms = message.channel.permissions_for(me)
-        if not discord_perms.send_messages:
+        can_send = (
+            discord_perms.send_messages_in_threads
+            if isinstance(message.channel, discord.Thread)
+            else discord_perms.send_messages
+        )
+        if not can_send:
             can_respond = False
-            log_debug(f"[PERMS] Missing Discord Send Messages in #{channel_name}")
+            required_perm = (
+                "Send Messages in Threads"
+                if isinstance(message.channel, discord.Thread)
+                else "Send Messages"
+            )
+            log_debug(f"[PERMS] Missing Discord {required_perm} in #{channel_name}")
 
     if not can_listen and not can_respond:
         log_debug(f"[PERMS] Channel #{channel_name} fully disabled — skipping")
@@ -2135,17 +2152,18 @@ async def on_message(message: discord.Message):
     saved_media: list[Path] = []
     content_text = message.content or ""
 
-    # Auto-reactions based on content (fire-and-forget, no block)
-    for emoji in _get_reactions_for_message(content_text):
-        with contextlib.suppress(discord.HTTPException, discord.Forbidden):
-            await message.add_reaction(emoji)
-
-    # Tracked words: increment counts for this user/guild
-    matched = _get_matched_tracked_words(content_text)
-    if matched:
-        await asyncio.to_thread(_record_word_counts, guild_id, message.author.id, matched)
+    # Reactions are outbound behavior, so honor the same respond policy as messages.
+    if can_respond:
+        for emoji in _get_reactions_for_message(content_text):
+            with contextlib.suppress(discord.HTTPException, discord.Forbidden):
+                await message.add_reaction(emoji)
 
     if can_listen:
+        # Tracked-word statistics are part of content consumption.
+        matched = _get_matched_tracked_words(content_text)
+        if matched:
+            await asyncio.to_thread(_record_word_counts, guild_id, message.author.id, matched)
+
         for att in message.attachments:
             saved = await download_attachment(att, guild_id, author_name, channel_name)
             if saved:
