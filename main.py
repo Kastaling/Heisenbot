@@ -38,6 +38,8 @@ from PIL import Image
 
 from heisenbot.config import env_bool, env_float, env_int
 from heisenbot.security import sanitize_filename, validate_public_http_url
+from heisenbot.tictactoe import describe_board as _ttt_describe_board
+from heisenbot.tictactoe import winner as _ttt_winner
 from heisenbot.timeutils import DURATION_RE as _DURATION_RE
 from heisenbot.timeutils import parse_duration
 
@@ -2561,14 +2563,12 @@ def _ttt_is_expired(game: dict) -> bool:
 
 
 async def _ttt_defer_response(interaction: discord.Interaction) -> bool:
-    """Acknowledge the interaction so we can edit the message later. Returns True on success."""
+    """Acknowledge a component click without creating a thinking message."""
     try:
-        if hasattr(interaction.response, "defer_update"):
-            await interaction.response.defer_update()
-            return True
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer(thinking=False)
         return True
-    except Exception:
+    except (discord.HTTPException, discord.NotFound) as error:
+        log_debug(f"[TTT] Failed to acknowledge interaction: {error}")
         return False
 
 
@@ -2577,38 +2577,21 @@ def _ttt_touch(game: dict) -> None:
     game["last_activity_at"] = time.monotonic()
 
 
-def _ttt_winner(board: list[str | None]) -> str | None:
-    """Return 'user'|'bot'|'draw'|None."""
-    lines = [
-        (0, 1, 2),
-        (3, 4, 5),
-        (6, 7, 8),
-        (0, 3, 6),
-        (1, 4, 7),
-        (2, 5, 8),
-        (0, 4, 8),
-        (2, 4, 6),
-    ]
-    for a, b, c in lines:
-        if board[a] and board[a] == board[b] == board[c]:
-            return board[a]
-    if all(board[i] is not None for i in range(9)):
-        return "draw"
-    return None
-
-
 def _ttt_board_display(board: list[str | None], user_m: str, bot_m: str) -> str:
     """Text grid for the current board. Cells 1-9; empty = number, taken = marker."""
 
     def cell(i: int) -> str:
         v = board[i]
-        if v == "user":
+        if v == "human":
             return user_m
         if v == "bot":
             return bot_m
         return str(i + 1)
 
+    human_label = discord.utils.escape_markdown(user_m)
+    bot_label = discord.utils.escape_markdown(bot_m)
     return (
+        f"**You:** {human_label} · **Heisenbot:** {bot_label}\n"
         "```\n"
         f" {cell(0)} │ {cell(1)} │ {cell(2)} \n"
         "───┼───┼───\n"
@@ -2619,27 +2602,18 @@ def _ttt_board_display(board: list[str | None], user_m: str, bot_m: str) -> str:
     )
 
 
-def _ttt_board_for_ollama(board: list[str | None], user_m: str, bot_m: str) -> str:
-    """One-line description for Ollama: which cells are what."""
-    parts = []
-    for i in range(9):
-        v = board[i]
-        if v == "user":
-            parts.append(f"{i + 1}:{user_m}")
-        elif v == "bot":
-            parts.append(f"{i + 1}:{bot_m}")
-        else:
-            parts.append(f"{i + 1}:empty")
-    return ", ".join(parts)
-
-
-def _ollama_ttt_move(board: list[str | None], bot_marker: str) -> int | None:
+def _ollama_ttt_move(
+    board: list[str | None],
+    human_marker: str,
+    bot_marker: str,
+) -> int | None:
     """Ask Ollama to pick an empty cell (0-8). Returns None on failure."""
-    other = "X" if bot_marker != "X" else "O"
-    board_desc = _ttt_board_for_ollama(board, other, bot_marker)
+    board_desc = _ttt_describe_board(board, human_marker, bot_marker)
     prompt = (
-        f"You are playing tic-tac-toe. Board (cells 1-9): {board_desc}. "
-        f"Your marker is '{bot_marker}'. Pick one EMPTY cell number (1-9). Reply with ONLY that number, nothing else."
+        "You are Heisenbot, the bot player in a tic-tac-toe game. "
+        f"The human owns marker {human_marker!r}; you own marker {bot_marker!r}. "
+        f"Current board: {board_desc}. Pick one empty cell for Heisenbot. "
+        "Reply with ONLY its cell number from 1 through 9."
     )
     try:
         resp = _ollama_chat_request(
@@ -2663,18 +2637,22 @@ def _ollama_ttt_move(board: list[str | None], bot_marker: str) -> int | None:
 
 def _ollama_ttt_comment(
     board: list[str | None],
+    human_marker: str,
     bot_marker: str,
     last_cell: int,
     won: bool,
+    human_name: str,
 ) -> str:
     """Get a short in-character comment about the game state."""
-    other = "X" if bot_marker != "X" else "O"
-    board_desc = _ttt_board_for_ollama(board, other, bot_marker)
+    board_desc = _ttt_describe_board(board, human_marker, bot_marker)
     prompt = (
-        f"You're Heisenbot playing tic-tac-toe. You just placed '{bot_marker}' in cell {last_cell + 1}. "
-        f"Board: {board_desc}. "
+        f"You are Heisenbot, playing tic-tac-toe against the human player {human_name!r}. "
+        f"The human owns marker {human_marker!r}; you own marker {bot_marker!r}. "
+        f"You just placed your marker in cell {last_cell + 1}. Board: {board_desc}. "
         + ("You won. " if won else "Game continues. ")
-        + "Say one short sentence: trash talk, observation, or reaction. No list, no hashtags. One sentence only."
+        + f"Address {human_name!r} as 'you' or by that name. Never call the human Heisenbot, "
+        "and never describe a human move as your own. Say one short sentence of trash talk, "
+        "observation, or reaction. No list or hashtags."
     )
     try:
         resp = _ollama_chat_request(
@@ -2700,14 +2678,20 @@ async def _ttt_handle_click(interaction: discord.Interaction, cell_index: int):
     game = _ttt_games.get(key)
     if not game:
         await interaction.response.send_message(
-            "This game is no longer active (replaced or expired). Use `..tictactoe` to start a new one.",
+            f"This game is no longer active (replaced or expired). Use `{COMMAND_PREFIX}tictactoe` to start a new one.",
             ephemeral=True,
         )
         return
     if _ttt_is_expired(game):
         _ttt_games.pop(key, None)
         await interaction.response.send_message(
-            "This game has expired (30 min timeout). Start a new one with `..tictactoe`.",
+            f"This game has expired. Start a new one with `{COMMAND_PREFIX}tictactoe`.",
+            ephemeral=True,
+        )
+        return
+    if interaction.user.id != game["human_id"]:
+        await interaction.response.send_message(
+            f"This is {game['human_name']}'s game. Start your own with `{COMMAND_PREFIX}tictactoe`.",
             ephemeral=True,
         )
         return
@@ -2718,32 +2702,47 @@ async def _ttt_handle_click(interaction: discord.Interaction, cell_index: int):
     if board[cell_index] is not None:
         await interaction.response.send_message("That cell is already taken.", ephemeral=True)
         return
+    # Claim the turn before the first await so rapid clicks cannot apply more
+    # than one human move while Discord is acknowledging the interaction.
+    game["turn"] = "bot"
     # Acknowledge immediately so we can edit the message later (required within 3s).
     if not await _ttt_defer_response(interaction):
+        game["turn"] = "user"
         with contextlib.suppress(discord.NotFound):
             await interaction.response.send_message(
-                "Something went wrong. Try again or start a new game with `..tictactoe`.",
+                f"Something went wrong. Try again or start a new game with `{COMMAND_PREFIX}tictactoe`.",
                 ephemeral=True,
             )
         return
     _ttt_touch(game)
     user_marker = game["user_marker"]
     bot_marker = game["bot_marker"]
-    board[cell_index] = "user"
+    board[cell_index] = "human"
     winner = _ttt_winner(board)
     if winner is not None:
         _ttt_games.pop(key, None)
-        view = _ttt_build_view(board, user_marker, bot_marker)
+        view = _ttt_build_view(board, user_marker, bot_marker, disable_empty=True)
         if winner == "draw":
             text = _ttt_board_display(board, user_marker, bot_marker) + "\n**Draw.**"
         else:
             text = _ttt_board_display(board, user_marker, bot_marker) + "\n**You win!**"
-        with contextlib.suppress(discord.NotFound):
-            await interaction.message.edit(content=text, view=view)
+        with contextlib.suppress(discord.HTTPException, discord.NotFound):
+            await interaction.edit_original_response(content=text, view=view)
         return
-    game["turn"] = "bot"
+
+    # Complete the deferred update immediately: show the human move and disable
+    # the board while Ollama works, without creating an ephemeral placeholder.
+    thinking_view = _ttt_build_view(board, user_marker, bot_marker, disable_empty=True)
+    thinking_text = _ttt_board_display(board, user_marker, bot_marker) + "\n**Heisenbot's turn…**"
+    try:
+        await interaction.edit_original_response(content=thinking_text, view=thinking_view)
+    except (discord.HTTPException, discord.NotFound) as error:
+        log_debug(f"[TTT] Failed to show bot turn: {error}")
+        _ttt_games.pop(key, None)
+        return
+
     # Bot turn: get move in thread, then comment, then edit message
-    move_idx = await _ollama_call(_ollama_ttt_move, board, bot_marker)
+    move_idx = await _ollama_call(_ollama_ttt_move, board, user_marker, bot_marker)
     if move_idx is None:
         empty = [i for i in range(9) if board[i] is None]
         move_idx = random.choice(empty) if empty else 0
@@ -2752,12 +2751,19 @@ async def _ttt_handle_click(interaction: discord.Interaction, cell_index: int):
     comment = await _ollama_call(
         _ollama_ttt_comment,
         board,
+        user_marker,
         bot_marker,
         move_idx,
         winner == "bot",
+        game["human_name"],
     )
     _ttt_touch(game)
-    view = _ttt_build_view(board, user_marker, bot_marker)
+    view = _ttt_build_view(
+        board,
+        user_marker,
+        bot_marker,
+        disable_empty=winner is not None,
+    )
     text = _ttt_board_display(board, user_marker, bot_marker) + "\n" + comment
     if winner == "bot":
         text += "\n**Heisenbot wins!**"
@@ -2766,8 +2772,9 @@ async def _ttt_handle_click(interaction: discord.Interaction, cell_index: int):
         text += "\n**Draw.**"
         _ttt_games.pop(key, None)
     try:
-        await interaction.message.edit(content=text, view=view)
-    except discord.NotFound:
+        await interaction.edit_original_response(content=text, view=view)
+    except (discord.HTTPException, discord.NotFound) as error:
+        log_debug(f"[TTT] Failed to update board: {error}")
         _ttt_games.pop(key, None)
         return
     if winner is not None:
@@ -2779,6 +2786,8 @@ def _ttt_build_view(
     board: list[str | None],
     user_marker: str,
     bot_marker: str,
+    *,
+    disable_empty: bool = False,
 ) -> discord.ui.View:
     """Build a View with 9 buttons in 3x3 grid: empty = clickable (label 1-9), taken = disabled with marker."""
     view = discord.ui.View(timeout=None)
@@ -2796,10 +2805,11 @@ def _ttt_build_view(
                 style=discord.ButtonStyle.primary,
                 label=str(i + 1),
                 custom_id=f"ttt_{i}",
+                disabled=disable_empty,
                 row=i // 3,
             )
         else:
-            label = user_marker if cell == "user" else bot_marker
+            label = user_marker if cell == "human" else bot_marker
             btn = discord.ui.Button(
                 style=discord.ButtonStyle.secondary,
                 label=label[:80],
@@ -2823,6 +2833,9 @@ async def tictactoe_cmd(ctx: commands.Context, user_marker: str = "", bot_marker
         user_marker = ""
     user_m = (user_marker or TTT_USER_MARKER_DEFAULT).strip()[:2] or "X"
     bot_m = (bot_marker or TTT_BOT_MARKER_DEFAULT).strip()[:2] or "O"
+    if user_m.casefold() == bot_m.casefold():
+        await ctx.send("Your marker and Heisenbot's marker must be different.")
+        return
     channel_id = ctx.channel.id
     # Replace any existing game(s) in this channel so only this message is active
     _ttt_clear_channel(channel_id)
@@ -2833,12 +2846,14 @@ async def tictactoe_cmd(ctx: commands.Context, user_marker: str = "", bot_marker
         "user_marker": user_m,
         "bot_marker": bot_m,
         "turn": "bot" if bot_goes_first else "user",
+        "human_id": ctx.author.id,
+        "human_name": ctx.author.display_name,
         "message_id": None,
         "channel_id": channel_id,
         "created_at": now,
         "last_activity_at": now,
     }
-    view = _ttt_build_view(board, user_m, bot_m)
+    view = _ttt_build_view(board, user_m, bot_m, disable_empty=bot_goes_first)
     text = _ttt_board_display(board, user_m, bot_m)
     if bot_goes_first:
         text += "\n**Heisenbot's turn…**"
@@ -2850,7 +2865,7 @@ async def tictactoe_cmd(ctx: commands.Context, user_marker: str = "", bot_marker
     _ttt_games[key] = game
     if bot_goes_first:
         # Run bot's first move and edit the message
-        move_idx = await _ollama_call(_ollama_ttt_move, board, bot_m)
+        move_idx = await _ollama_call(_ollama_ttt_move, board, user_m, bot_m)
         if move_idx is None:
             move_idx = random.choice([i for i in range(9)])
         board[move_idx] = "bot"
@@ -2858,12 +2873,19 @@ async def tictactoe_cmd(ctx: commands.Context, user_marker: str = "", bot_marker
         comment = await _ollama_call(
             _ollama_ttt_comment,
             board,
+            user_m,
             bot_m,
             move_idx,
             winner == "bot",
+            ctx.author.display_name,
         )
         _ttt_touch(game)
-        view = _ttt_build_view(board, user_m, bot_m)
+        view = _ttt_build_view(
+            board,
+            user_m,
+            bot_m,
+            disable_empty=winner is not None,
+        )
         text = _ttt_board_display(board, user_m, bot_m) + "\n" + comment
         if winner == "bot":
             text += "\n**Heisenbot wins!**"
