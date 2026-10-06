@@ -46,6 +46,8 @@ See [.env.example](.env.example) for every common setting. Useful behavior contr
 | `VISION_ENABLED` | `true` | Enables image/video descriptions |
 | `AUTO_SEARCH_ENABLED` | `true` | Lets the model request web search |
 | `LOG_MESSAGE_CONTENT` | `false` | Opt-in message previews in logs; leave off for privacy |
+| `CONNECT4_SEARCH_DEPTH` | `5` | Connect Four look-ahead depth (`1`–`7`) |
+| `CONNECT4_TIMEOUT_SECONDS` | `1800` | Inactive Connect Four game expiry (`60`–`86400`) |
 | `SYSTEM_PROMPT` | built in | Inline personality override |
 | `SYSTEM_PROMPT_FILE` | unset | UTF-8 file that replaces the built-in personality prompt |
 
@@ -74,7 +76,7 @@ Heisenbot stores message text, Discord user IDs/display names, channel metadata,
 - `..leaderboard [timespan]` — cross-server leaderboard (owner only)
 - `..wordstats [@member]`, `..wordleaderboard [word]`
 - `..channel allow|deny|reset`, `..channels`
-- `..tictactoe`, `..getcaptioned`, `..poster`, `..rage`
+- `..tictactoe`, `..connect4 [botfirst]`, `..getcaptioned`, `..poster`, `..rage`
 - `..gpu` — owner-only NVIDIA status
 
 Use Discord channel permissions as the primary access boundary. Heisenbot now skips reply generation when it lacks `Send Messages`, avoiding expensive work followed by a Discord 403.

@@ -37,6 +37,12 @@ from dotenv import load_dotenv
 from PIL import Image
 
 from heisenbot.config import env_bool, env_float, env_int
+from heisenbot.connect4 import choose_bot_move as _c4_choose_bot_move
+from heisenbot.connect4 import describe_board as _c4_describe_board
+from heisenbot.connect4 import drop_piece as _c4_drop_piece
+from heisenbot.connect4 import new_board as _c4_new_board
+from heisenbot.connect4 import valid_columns as _c4_valid_columns
+from heisenbot.connect4 import winner as _c4_winner
 from heisenbot.security import sanitize_filename, validate_public_http_url
 from heisenbot.tictactoe import describe_board as _ttt_describe_board
 from heisenbot.tictactoe import winner as _ttt_winner
@@ -2953,6 +2959,296 @@ async def tictactoe_cmd(ctx: commands.Context, user_marker: str = "", bot_marker
             await msg.edit(content=text, view=view)
         except discord.NotFound:
             _ttt_games.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
+# Connect Four: emoji board, column buttons, gravity, and local search AI
+# ---------------------------------------------------------------------------
+CONNECT4_TIMEOUT_SECONDS = env_int(
+    "CONNECT4_TIMEOUT_SECONDS",
+    30 * 60,
+    minimum=60,
+    maximum=24 * 60 * 60,
+)
+CONNECT4_SEARCH_DEPTH = env_int("CONNECT4_SEARCH_DEPTH", 5, minimum=1, maximum=7)
+CONNECT4_HUMAN_EMOJI = "🔴"
+CONNECT4_BOT_EMOJI = "🟡"
+CONNECT4_EMPTY_EMOJI = "⚫"
+CONNECT4_COLUMN_EMOJIS = ("1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣")
+
+_c4_games: dict[tuple[int, int], dict] = {}
+
+
+def _c4_game_key(channel_id: int, message_id: int) -> tuple[int, int]:
+    return (channel_id, message_id)
+
+
+def _c4_clear_channel(channel_id: int) -> None:
+    for key in [key for key in _c4_games if key[0] == channel_id]:
+        _c4_games.pop(key, None)
+
+
+def _c4_is_expired(game: dict) -> bool:
+    try:
+        last_activity = game.get("last_activity_at") or game.get("created_at") or 0
+        return (time.monotonic() - last_activity) > CONNECT4_TIMEOUT_SECONDS
+    except (TypeError, KeyError):
+        return True
+
+
+def _c4_touch(game: dict) -> None:
+    game["last_activity_at"] = time.monotonic()
+
+
+def _c4_board_display(board: list[list[str | None]]) -> str:
+    symbols = {
+        None: CONNECT4_EMPTY_EMOJI,
+        "human": CONNECT4_HUMAN_EMOJI,
+        "bot": CONNECT4_BOT_EMOJI,
+    }
+    rows = ["".join(symbols[cell] for cell in row) for row in board]
+    return (
+        f"**You:** {CONNECT4_HUMAN_EMOJI} · **Heisenbot:** {CONNECT4_BOT_EMOJI}\n"
+        + "".join(CONNECT4_COLUMN_EMOJIS)
+        + "\n"
+        + "\n".join(rows)
+    )
+
+
+def _c4_build_view(
+    board: list[list[str | None]],
+    *,
+    disable_all: bool = False,
+) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+
+    def _make_callback(column: int):
+        async def _click(interaction: discord.Interaction):
+            await _c4_handle_click(interaction, column)
+
+        return _click
+
+    valid = set(_c4_valid_columns(board))
+    for column in range(7):
+        button = discord.ui.Button(
+            style=discord.ButtonStyle.primary,
+            label=str(column + 1),
+            custom_id=f"connect4_{column}",
+            disabled=disable_all or column not in valid,
+            row=column // 5,
+        )
+        button.callback = _make_callback(column)
+        view.add_item(button)
+    return view
+
+
+def _ollama_c4_comment(
+    board: list[list[str | None]],
+    column: int,
+    result: str | None,
+    human_name: str,
+) -> str:
+    board_description = _c4_describe_board(board)
+    outcome = "You won." if result == "bot" else "The game continues."
+    prompt = (
+        f"You are Heisenbot playing Connect Four against {human_name!r}. "
+        "The human is red and you are yellow. "
+        f"You just dropped yellow into column {column + 1}. {board_description}. {outcome} "
+        f"Address {human_name!r} as 'you' or by that name. Never call the human Heisenbot. "
+        "Say one short sentence of trash talk, observation, or reaction. No list or hashtags."
+    )
+    try:
+        response = _ollama_chat_request(
+            model=OLLAMA_VERIFIER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0.8, "num_predict": 60, "num_ctx": 512},
+            think=False,
+            label="connect4-comment",
+        )
+        text = (response.message and response.message.content or "").strip()
+        if text:
+            return text[:200]
+    except Exception as error:
+        log_debug(f"[CONNECT4] Comment generation failed: {error}")
+    if result == "bot":
+        return "Four in a row. Chemistry wins again."
+    return f"Column {column + 1}. Your move."
+
+
+async def _c4_play_bot(game: dict) -> tuple[int, str | None, str]:
+    board = game["board"]
+    valid = _c4_valid_columns(board)
+    if not valid:
+        return 0, "draw", "The board is full."
+    try:
+        column = await asyncio.to_thread(_c4_choose_bot_move, board, CONNECT4_SEARCH_DEPTH)
+    except (TypeError, ValueError) as error:
+        log(f"[CONNECT4] Local AI failed: {error}")
+        column = None
+    if column not in valid:
+        column = random.choice(valid)
+    _c4_drop_piece(board, column, "bot")
+    result = _c4_winner(board)
+    comment = await _ollama_call(
+        _ollama_c4_comment,
+        board,
+        column,
+        result,
+        game["human_name"],
+    )
+    _c4_touch(game)
+    return column, result, comment
+
+
+def _c4_final_status(result: str | None) -> str:
+    if result == "human":
+        return "**You win!**"
+    if result == "bot":
+        return "**Heisenbot wins!**"
+    if result == "draw":
+        return "**Draw.**"
+    return "**Your turn.** Choose a column."
+
+
+async def _c4_handle_click(interaction: discord.Interaction, column: int) -> None:
+    key = _c4_game_key(interaction.channel_id, interaction.message.id)
+    game = _c4_games.get(key)
+    if not game:
+        await interaction.response.send_message(
+            f"This game is no longer active. Use `{COMMAND_PREFIX}connect4` to start a new one.",
+            ephemeral=True,
+        )
+        return
+    if _c4_is_expired(game):
+        _c4_games.pop(key, None)
+        await interaction.response.send_message(
+            f"This game has expired. Start a new one with `{COMMAND_PREFIX}connect4`.",
+            ephemeral=True,
+        )
+        return
+    if interaction.user.id != game["human_id"]:
+        human_name = discord.utils.escape_markdown(game["human_name"])
+        await interaction.response.send_message(
+            f"This is {human_name}'s game. Start your own with `{COMMAND_PREFIX}connect4`.",
+            ephemeral=True,
+        )
+        return
+    if game["turn"] != "human":
+        await interaction.response.send_message("It's not your turn.", ephemeral=True)
+        return
+
+    board = game["board"]
+    if column not in _c4_valid_columns(board):
+        await interaction.response.send_message("That column is full.", ephemeral=True)
+        return
+
+    # Claim the turn before acknowledging the interaction so rapid clicks
+    # cannot place multiple human pieces.
+    game["turn"] = "bot"
+    try:
+        await interaction.response.defer(thinking=False)
+    except (discord.HTTPException, discord.NotFound) as error:
+        game["turn"] = "human"
+        log_debug(f"[CONNECT4] Failed to acknowledge interaction: {error}")
+        return
+
+    _c4_drop_piece(board, column, "human")
+    _c4_touch(game)
+    result = _c4_winner(board)
+    if result is not None:
+        _c4_games.pop(key, None)
+        content = _c4_board_display(board) + "\n" + _c4_final_status(result)
+        with contextlib.suppress(discord.HTTPException, discord.NotFound):
+            await interaction.edit_original_response(
+                content=content,
+                view=_c4_build_view(board, disable_all=True),
+            )
+        return
+
+    try:
+        await interaction.edit_original_response(
+            content=_c4_board_display(board) + "\n**Heisenbot's turn…**",
+            view=_c4_build_view(board, disable_all=True),
+        )
+    except (discord.HTTPException, discord.NotFound) as error:
+        log_debug(f"[CONNECT4] Failed to show bot turn: {error}")
+        _c4_games.pop(key, None)
+        return
+
+    _, result, comment = await _c4_play_bot(game)
+    if result is not None:
+        _c4_games.pop(key, None)
+    else:
+        game["turn"] = "human"
+    content = _c4_board_display(board) + "\n" + comment + "\n" + _c4_final_status(result)
+    try:
+        await interaction.edit_original_response(
+            content=content,
+            view=_c4_build_view(board, disable_all=result is not None),
+        )
+    except (discord.HTTPException, discord.NotFound) as error:
+        log_debug(f"[CONNECT4] Failed to update board: {error}")
+        _c4_games.pop(key, None)
+
+
+@bot.command(name="connect4", aliases=["c4", "connectfour"])
+@commands.cooldown(1, 5, commands.BucketType.user)
+@commands.max_concurrency(1, per=commands.BucketType.channel, wait=False)
+async def connect4_cmd(ctx: commands.Context, *, mode: str = ""):
+    """Start Connect Four. Use ``..connect4 botfirst`` to let Heisenbot move first."""
+    normalized_mode = mode.strip().lower()
+    if normalized_mode not in {"", "botfirst", "bot_first"}:
+        await ctx.send(f"Usage: `{COMMAND_PREFIX}connect4 [botfirst]`")
+        return
+    bot_goes_first = bool(normalized_mode)
+    channel_id = ctx.channel.id
+    active_game = next(
+        (
+            game
+            for (game_channel_id, _), game in _c4_games.items()
+            if game_channel_id == channel_id and not _c4_is_expired(game)
+        ),
+        None,
+    )
+    if active_game and active_game.get("human_id") != ctx.author.id:
+        active_name = discord.utils.escape_markdown(active_game.get("human_name", "another player"))
+        await ctx.send(f"{active_name} already has an active Connect Four game here.")
+        return
+
+    _c4_clear_channel(channel_id)
+    now = time.monotonic()
+    board = _c4_new_board()
+    game = {
+        "board": board,
+        "turn": "bot" if bot_goes_first else "human",
+        "human_id": ctx.author.id,
+        "human_name": ctx.author.display_name,
+        "created_at": now,
+        "last_activity_at": now,
+    }
+    status = "**Heisenbot's turn…**" if bot_goes_first else _c4_final_status(None)
+    message = await ctx.send(
+        _c4_board_display(board) + "\n" + status,
+        view=_c4_build_view(board, disable_all=bot_goes_first),
+    )
+    key = _c4_game_key(channel_id, message.id)
+    _c4_games[key] = game
+
+    if bot_goes_first:
+        _, result, comment = await _c4_play_bot(game)
+        if result is not None:
+            _c4_games.pop(key, None)
+        else:
+            game["turn"] = "human"
+        content = _c4_board_display(board) + "\n" + comment + "\n" + _c4_final_status(result)
+        try:
+            await message.edit(
+                content=content,
+                view=_c4_build_view(board, disable_all=result is not None),
+            )
+        except (discord.HTTPException, discord.NotFound) as error:
+            log_debug(f"[CONNECT4] Failed to update opening move: {error}")
+            _c4_games.pop(key, None)
 
 
 @bot.command(name="context", aliases=["ctx"])
