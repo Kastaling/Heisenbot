@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 import pytest
 
 from heisenbot.stats import (
@@ -6,6 +8,7 @@ from heisenbot.stats import (
     format_bytes,
     format_media_breakdown,
     format_media_summary,
+    format_relative_timestamp,
     scan_media,
 )
 
@@ -56,6 +59,13 @@ def test_invalid_formatting_inputs_are_rejected():
         format_bytes(-1)
     with pytest.raises(ValueError):
         batch_lengths([1], max_items=0)
+
+
+def test_relative_timestamp_uses_discord_syntax_and_handles_never():
+    assert format_relative_timestamp(None) == "Never"
+    assert format_relative_timestamp(datetime(2024, 1, 1, tzinfo=UTC)) == "<t:1704067200:R>"
+    with pytest.raises(ValueError, match="timezone"):
+        format_relative_timestamp(datetime(2024, 1, 1))
 
 
 def test_scan_media_counts_sizes_and_excludes_non_guild_directories_and_symlinks(tmp_path):

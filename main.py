@@ -47,6 +47,7 @@ from heisenbot.security import sanitize_filename, validate_public_http_url
 from heisenbot.stats import MediaStats, batch_lengths
 from heisenbot.stats import format_media_breakdown as _format_media_breakdown
 from heisenbot.stats import format_media_summary as _format_media_summary
+from heisenbot.stats import format_relative_timestamp as _format_relative_timestamp
 from heisenbot.stats import scan_media as _scan_media
 from heisenbot.tictactoe import describe_board as _ttt_describe_board
 from heisenbot.tictactoe import winner as _ttt_winner
@@ -238,8 +239,11 @@ def _get_stats_db() -> sqlite3.Connection:
         """)
         _stats_conn.execute("CREATE INDEX IF NOT EXISTS idx_ev_ts ON events(ts)")
         _stats_conn.execute("CREATE INDEX IF NOT EXISTS idx_ev_guild ON events(guild_id)")
-        _stats_conn.execute("CREATE INDEX IF NOT EXISTS idx_ev_etype ON events(etype)")
         _stats_conn.execute("CREATE INDEX IF NOT EXISTS idx_ev_guild_ts ON events(guild_id, ts)")
+        _stats_conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ev_etype_guild_ts ON events(etype, guild_id, ts)"
+        )
+        _stats_conn.execute("DROP INDEX IF EXISTS idx_ev_etype")
         _stats_conn.execute("""
             CREATE TABLE IF NOT EXISTS word_counts (
                 guild_id INTEGER NOT NULL,
@@ -314,6 +318,27 @@ def _stats_per_guild(
     for row in _stats_fetchall(query, params):
         gid, etype, cnt = row
         result.setdefault(gid, {})[etype] = cnt
+    return result
+
+
+def _latest_successful_replies() -> dict[int, datetime]:
+    """Return the most recent successful bot reply timestamp for each guild."""
+    rows = _stats_fetchall(
+        "SELECT guild_id, MAX(ts) FROM events WHERE etype = ? GROUP BY guild_id",
+        ("reply_sent",),
+    )
+    result: dict[int, datetime] = {}
+    for guild_id, raw_timestamp in rows:
+        try:
+            timestamp = datetime.fromisoformat(raw_timestamp)
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=UTC)
+            result[guild_id] = timestamp.astimezone(UTC)
+        except (TypeError, ValueError):
+            logging.getLogger("heisenbot").warning(
+                "Ignoring invalid successful-reply timestamp for guild %s",
+                guild_id,
+            )
     return result
 
 
@@ -3351,6 +3376,7 @@ def _build_stats_embed(
     media: MediaStats,
     color: int,
     time_label: str,
+    last_sent: datetime | None,
     *,
     include_rank_note: bool = False,
 ) -> discord.Embed:
@@ -3379,6 +3405,11 @@ def _build_stats_embed(
         value=_format_media_summary(media),
         inline=True,
     )
+    em.add_field(
+        name="Last Message Sent",
+        value=_format_relative_timestamp(last_sent),
+        inline=False,
+    )
 
     em.add_field(
         name="Media Breakdown",
@@ -3386,7 +3417,7 @@ def _build_stats_embed(
         inline=False,
     )
 
-    footer = f"Messages/Replies: {time_label} · Media: all time (on disk)"
+    footer = f"Messages/Replies: {time_label} · Last sent: all time · Media: all time (on disk)"
     if include_rank_note:
         footer += " · Ranked by messages seen"
     em.set_footer(text=footer)
@@ -3417,9 +3448,11 @@ async def stats_cmd(ctx: commands.Context, *, timespan: str = ""):
         # Cross-server data is owner-only; guild managers see only their guild.
         scopes.append(("Stats — All Servers", None, 0x2ECC71))
 
-    snapshots = await asyncio.gather(
-        *(_stats_snapshot(guild_id, since) for _, guild_id, _ in scopes)
+    *snapshots, latest_by_guild = await asyncio.gather(
+        *(_stats_snapshot(guild_id, since) for _, guild_id, _ in scopes),
+        asyncio.to_thread(_latest_successful_replies),
     )
+    global_last_sent = max(latest_by_guild.values(), default=None)
     embeds = [
         _build_stats_embed(
             title=title,
@@ -3427,8 +3460,9 @@ async def stats_cmd(ctx: commands.Context, *, timespan: str = ""):
             media=media,
             color=color,
             time_label=time_label,
+            last_sent=(global_last_sent if guild_id is None else latest_by_guild.get(guild_id)),
         )
-        for (title, _, color), (counts, media) in zip(scopes, snapshots, strict=True)
+        for (title, guild_id, color), (counts, media) in zip(scopes, snapshots, strict=True)
     ]
 
     await ctx.send(embeds=embeds)
@@ -3466,8 +3500,9 @@ async def leaderboard_cmd(ctx: commands.Context, *, timespan: str = ""):
     embeds: list[discord.Embed] = []
     medal = ["🥇", "🥈", "🥉"]
 
-    media_results = await asyncio.gather(
-        *(asyncio.to_thread(_media_stats_from_disk, gid) for gid, _ in ranked)
+    *media_results, latest_by_guild = await asyncio.gather(
+        *(asyncio.to_thread(_media_stats_from_disk, gid) for gid, _ in ranked),
+        asyncio.to_thread(_latest_successful_replies),
     )
     for rank, ((gid, counts), media) in enumerate(
         zip(ranked, media_results, strict=True),
@@ -3489,6 +3524,7 @@ async def leaderboard_cmd(ctx: commands.Context, *, timespan: str = ""):
             if rank == 3
             else 0x95A5A6,
             time_label=time_label,
+            last_sent=latest_by_guild.get(gid),
             include_rank_note=True,
         )
         embeds.append(em)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 
@@ -124,6 +125,15 @@ def format_media_breakdown(by_extension: dict[str, int], max_length: int = 1024)
     if omitted:
         value += f"  *+{omitted} more*"
     return value or "*No media files found*"
+
+
+def format_relative_timestamp(value: datetime | None) -> str:
+    """Format a timestamp using Discord's locale-aware relative time syntax."""
+    if value is None:
+        return "Never"
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("timestamp must include a timezone")
+    return f"<t:{int(value.timestamp())}:R>"
 
 
 def batch_lengths(
