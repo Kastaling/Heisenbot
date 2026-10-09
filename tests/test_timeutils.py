@@ -1,6 +1,6 @@
 from datetime import timedelta
 
-from heisenbot.timeutils import parse_duration
+from heisenbot.timeutils import format_duration, parse_duration
 
 
 def test_parse_duration_supports_combined_units():
@@ -20,3 +20,9 @@ def test_parse_duration_rejects_partial_or_unknown_input():
 def test_parse_duration_rejects_excessive_values():
     assert parse_duration("101y") is None
     assert parse_duration("999999999999999999999999999999999999y") is None
+
+
+def test_format_duration_is_canonical_and_bounded():
+    assert format_duration(timedelta(hours=1, minutes=30)) == "1hr 30min"
+    assert format_duration(timedelta(days=372, hours=2)) == "1yr 1wk 2hr"
+    assert format_duration(timedelta()) == "0min"

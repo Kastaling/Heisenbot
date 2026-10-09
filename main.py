@@ -44,10 +44,13 @@ from heisenbot.connect4 import new_board as _c4_new_board
 from heisenbot.connect4 import valid_columns as _c4_valid_columns
 from heisenbot.connect4 import winner as _c4_winner
 from heisenbot.security import sanitize_filename, validate_public_http_url
+from heisenbot.stats import MediaStats, batch_lengths
+from heisenbot.stats import format_media_breakdown as _format_media_breakdown
+from heisenbot.stats import format_media_summary as _format_media_summary
+from heisenbot.stats import scan_media as _scan_media
 from heisenbot.tictactoe import describe_board as _ttt_describe_board
 from heisenbot.tictactoe import winner as _ttt_winner
-from heisenbot.timeutils import DURATION_RE as _DURATION_RE
-from heisenbot.timeutils import parse_duration
+from heisenbot.timeutils import format_duration, parse_duration
 
 load_dotenv()
 
@@ -236,6 +239,7 @@ def _get_stats_db() -> sqlite3.Connection:
         _stats_conn.execute("CREATE INDEX IF NOT EXISTS idx_ev_ts ON events(ts)")
         _stats_conn.execute("CREATE INDEX IF NOT EXISTS idx_ev_guild ON events(guild_id)")
         _stats_conn.execute("CREATE INDEX IF NOT EXISTS idx_ev_etype ON events(etype)")
+        _stats_conn.execute("CREATE INDEX IF NOT EXISTS idx_ev_guild_ts ON events(guild_id, ts)")
         _stats_conn.execute("""
             CREATE TABLE IF NOT EXISTS word_counts (
                 guild_id INTEGER NOT NULL,
@@ -315,31 +319,9 @@ def _stats_per_guild(
 
 def _media_stats_from_disk(
     guild_id: int | None = None,
-) -> tuple[int, dict[str, int]]:
-    """Count media files and breakdown by extension from ./media/ on disk.
-    If guild_id is given, only that guild's folder. Otherwise all guilds.
-    Returns (total_count, {EXT: count})."""
-    breakdown: dict[str, int] = {}
-    total = 0
-    try:
-        if guild_id is not None:
-            dirs = [MEDIA_BASE / str(guild_id)]
-        else:
-            dirs = [d for d in MEDIA_BASE.iterdir() if d.is_dir()] if MEDIA_BASE.is_dir() else []
-
-        for d in dirs:
-            if not d.is_dir():
-                continue
-            for f in d.iterdir():
-                if not f.is_file():
-                    continue
-                total += 1
-                ext = f.suffix.lstrip(".").upper() or "OTHER"
-                breakdown[ext] = breakdown.get(ext, 0) + 1
-    except OSError:
-        pass
-    sorted_bd = dict(sorted(breakdown.items(), key=lambda kv: kv[1], reverse=True))
-    return total, sorted_bd
+) -> MediaStats:
+    """Measure media stored for one guild, or all numeric guild directories."""
+    return _scan_media(MEDIA_BASE, guild_id)
 
 
 # ---------------------------------------------------------------------------
@@ -3340,13 +3322,37 @@ def _format_number(n: int) -> str:
     return f"{n:,}"
 
 
+def _stats_period(timespan: str) -> tuple[datetime | None, str] | None:
+    """Parse an optional stats duration and return its UTC boundary and label."""
+    value = timespan.strip()
+    if not value:
+        return None, "All time"
+    delta = parse_duration(value)
+    if delta is None:
+        return None
+    return datetime.now(UTC) - delta, f"Last {format_duration(delta)}"
+
+
+async def _stats_snapshot(
+    guild_id: int | None,
+    since: datetime | None,
+) -> tuple[dict[str, int], MediaStats]:
+    """Fetch database counts and filesystem media totals concurrently."""
+    counts, media = await asyncio.gather(
+        asyncio.to_thread(_stats_query, guild_id, since),
+        asyncio.to_thread(_media_stats_from_disk, guild_id),
+    )
+    return counts, media
+
+
 def _build_stats_embed(
     title: str,
     counts: dict[str, int],
-    media_total: int,
-    media_breakdown: dict[str, int],
+    media: MediaStats,
     color: int,
     time_label: str,
+    *,
+    include_rank_note: bool = False,
 ) -> discord.Embed:
     em = discord.Embed(title=title, color=color)
 
@@ -3362,7 +3368,7 @@ def _build_stats_embed(
     )
     reply_str = f"{_format_number(reply_ok)}"
     if reply_total > 0:
-        reply_str += f"  ({reply_ok}/{reply_total} successful)"
+        reply_str += f"  ({_format_number(reply_ok)}/{_format_number(reply_total)} successful)"
     em.add_field(
         name="Replies Sent",
         value=reply_str,
@@ -3370,106 +3376,80 @@ def _build_stats_embed(
     )
     em.add_field(
         name="Media on Disk",
-        value=_format_number(media_total),
+        value=_format_media_summary(media),
         inline=True,
     )
 
-    if media_breakdown:
-        breakdown = "  ".join(
-            f"**{ext}:** {_format_number(n)}" for ext, n in media_breakdown.items()
-        )
-        if len(breakdown) > 1024:
-            breakdown = breakdown[:1021] + "..."
-        em.add_field(name="Media Breakdown", value=breakdown, inline=False)
-    else:
-        em.add_field(name="Media Breakdown", value="*No media files found*", inline=False)
+    em.add_field(
+        name="Media Breakdown",
+        value=_format_media_breakdown(media.by_extension),
+        inline=False,
+    )
 
-    em.set_footer(text=f"Messages/Replies: {time_label} · Media: all time (on disk)")
+    footer = f"Messages/Replies: {time_label} · Media: all time (on disk)"
+    if include_rank_note:
+        footer += " · Ranked by messages seen"
+    em.set_footer(text=footer)
     return em
 
 
 @bot.command(name="stats")
+@commands.cooldown(1, 10, commands.BucketType.user)
 async def stats_cmd(ctx: commands.Context, *, timespan: str = ""):
     """Show bot statistics. Optional time filter: ..stats 1h2d4w"""
     if not _is_admin(ctx):
         await ctx.send("You need server management permissions to use this.")
         return
 
-    since: datetime | None = None
-    time_label = "All time"
-    if timespan.strip():
-        delta = parse_duration(timespan.strip())
-        if delta is None:
-            await ctx.send(
-                "Invalid time format. Examples: `30m`, `12h`, `7d`, `2w`, `1y`, `1h2d4w`\n"
-                "Units: **m**inutes, **h**ours, **d**ays, **w**eeks, **y**ears"
-            )
-            return
-        since = datetime.now(UTC) - delta
-        # Build a human-friendly label
-        parts = _DURATION_RE.findall(timespan.strip())
-        unit_names = {"m": "min", "h": "hr", "d": "day", "w": "wk", "y": "yr"}
-        time_label = "Last " + " ".join(f"{amt}{unit_names.get(u.lower(), u)}" for amt, u in parts)
+    period = _stats_period(timespan)
+    if period is None:
+        await ctx.send(
+            "Invalid time format. Examples: `30m`, `12h`, `7d`, `2w`, `1y`, `1h2d4w`\n"
+            "Units: **m**inutes, **h**ours, **d**ays, **w**eeks, **y**ears"
+        )
+        return
+    since, time_label = period
 
-    # Guild-specific stats
-    guild_id = ctx.guild.id if ctx.guild else 0
-    guild_counts, guild_media_result = await asyncio.gather(
-        asyncio.to_thread(_stats_query, guild_id, since),
-        asyncio.to_thread(_media_stats_from_disk, guild_id),
-    )
-    guild_media_total, guild_media_bd = guild_media_result
-    guild_embed = _build_stats_embed(
-        title=f"Stats — {ctx.guild.name}" if ctx.guild else "Stats — DM",
-        counts=guild_counts,
-        media_total=guild_media_total,
-        media_breakdown=guild_media_bd,
-        color=0x3498DB,
-        time_label=time_label,
-    )
-
-    embeds = [guild_embed]
+    scopes: list[tuple[str, int | None, int]] = []
+    if ctx.guild is not None:
+        scopes.append((f"Stats — {ctx.guild.name}", ctx.guild.id, 0x3498DB))
     if _is_owner(ctx):
         # Cross-server data is owner-only; guild managers see only their guild.
-        global_counts, global_media_result = await asyncio.gather(
-            asyncio.to_thread(_stats_query, None, since),
-            asyncio.to_thread(_media_stats_from_disk, None),
+        scopes.append(("Stats — All Servers", None, 0x2ECC71))
+
+    snapshots = await asyncio.gather(
+        *(_stats_snapshot(guild_id, since) for _, guild_id, _ in scopes)
+    )
+    embeds = [
+        _build_stats_embed(
+            title=title,
+            counts=counts,
+            media=media,
+            color=color,
+            time_label=time_label,
         )
-        global_media_total, global_media_bd = global_media_result
-        embeds.append(
-            _build_stats_embed(
-                title="Stats — All Servers",
-                counts=global_counts,
-                media_total=global_media_total,
-                media_breakdown=global_media_bd,
-                color=0x2ECC71,
-                time_label=time_label,
-            )
-        )
+        for (title, _, color), (counts, media) in zip(scopes, snapshots, strict=True)
+    ]
 
     await ctx.send(embeds=embeds)
 
 
 @bot.command(name="leaderboard", aliases=["lb"])
+@commands.cooldown(1, 15, commands.BucketType.user)
 async def leaderboard_cmd(ctx: commands.Context, *, timespan: str = ""):
     """Show a ranked leaderboard of all servers. Optional time filter: ..lb 7d"""
     if not _is_owner(ctx):
         await ctx.send("Only the bot owner can view cross-server statistics.")
         return
 
-    since: datetime | None = None
-    time_label = "All time"
-    if timespan.strip():
-        delta = parse_duration(timespan.strip())
-        if delta is None:
-            await ctx.send(
-                "Invalid time format. Examples: `30m`, `12h`, `7d`, `2w`, `1y`, `1h2d4w`\n"
-                "Units: **m**inutes, **h**ours, **d**ays, **w**eeks, **y**ears"
-            )
-            return
-        since = datetime.now(UTC) - delta
-        parts = _DURATION_RE.findall(timespan.strip())
-        unit_names = {"m": "min", "h": "hr", "d": "day", "w": "wk", "y": "yr"}
-        time_label = "Last " + " ".join(f"{amt}{unit_names.get(u.lower(), u)}" for amt, u in parts)
+    period = _stats_period(timespan)
+    if period is None:
+        await ctx.send(
+            "Invalid time format. Examples: `30m`, `12h`, `7d`, `2w`, `1y`, `1h2d4w`\n"
+            "Units: **m**inutes, **h**ours, **d**ays, **w**eeks, **y**ears"
+        )
+        return
+    since, time_label = period
 
     per_guild = await asyncio.to_thread(_stats_per_guild, since)
     if not per_guild:
@@ -3479,8 +3459,7 @@ async def leaderboard_cmd(ctx: commands.Context, *, timespan: str = ""):
     # Sort guilds by messages seen (descending)
     ranked = sorted(
         per_guild.items(),
-        key=lambda kv: kv[1].get("message_seen", 0),
-        reverse=True,
+        key=lambda item: (-item[1].get("message_seen", 0), item[0]),
     )
 
     # Build one embed per guild, Discord allows max 10 embeds per message
@@ -3490,7 +3469,7 @@ async def leaderboard_cmd(ctx: commands.Context, *, timespan: str = ""):
     media_results = await asyncio.gather(
         *(asyncio.to_thread(_media_stats_from_disk, gid) for gid, _ in ranked)
     )
-    for rank, ((gid, counts), (media_total, media_bd)) in enumerate(
+    for rank, ((gid, counts), media) in enumerate(
         zip(ranked, media_results, strict=True),
         1,
     ):
@@ -3501,8 +3480,7 @@ async def leaderboard_cmd(ctx: commands.Context, *, timespan: str = ""):
         em = _build_stats_embed(
             title=f"{prefix}  {name}",
             counts=counts,
-            media_total=media_total,
-            media_breakdown=media_bd,
+            media=media,
             color=0xF1C40F
             if rank == 1
             else 0xC0C0C0
@@ -3511,12 +3489,13 @@ async def leaderboard_cmd(ctx: commands.Context, *, timespan: str = ""):
             if rank == 3
             else 0x95A5A6,
             time_label=time_label,
+            include_rank_note=True,
         )
         embeds.append(em)
 
-    # Discord caps at 10 embeds per message — send in batches
-    for i in range(0, len(embeds), 10):
-        await ctx.send(embeds=embeds[i : i + 10])
+    # Discord caps both embed count and aggregate embed characters per message.
+    for start, end in batch_lengths([len(embed) for embed in embeds]):
+        await ctx.send(embeds=embeds[start:end])
 
 
 # ---------------------------------------------------------------------------

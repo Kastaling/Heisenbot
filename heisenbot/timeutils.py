@@ -36,3 +36,24 @@ def parse_duration(text: str) -> timedelta | None:
         if total > MAX_DURATION:
             return None
     return total
+
+
+def format_duration(value: timedelta) -> str:
+    """Format a non-negative duration as a short canonical label."""
+    total_minutes = int(value.total_seconds() // 60)
+    if total_minutes < 0:
+        raise ValueError("duration cannot be negative")
+    units = (
+        (365 * 24 * 60, "yr"),
+        (7 * 24 * 60, "wk"),
+        (24 * 60, "day"),
+        (60, "hr"),
+        (1, "min"),
+    )
+    parts: list[str] = []
+    remaining = total_minutes
+    for minutes, label in units:
+        amount, remaining = divmod(remaining, minutes)
+        if amount:
+            parts.append(f"{amount}{label}")
+    return " ".join(parts) or "0min"

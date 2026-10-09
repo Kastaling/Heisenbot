@@ -72,7 +72,7 @@ Heisenbot stores message text, Discord user IDs/display names, channel metadata,
 
 - `..ping`, `..invite`
 - `..context` — last assembled prompt context (owner only)
-- `..stats [30m|12h|7d]` — current-server stats for managers; global totals for the owner
+- `..stats [30m|12h|7d]` — current-server stats for managers; global totals for the owner, including media size and average file size
 - `..leaderboard [timespan]` — cross-server leaderboard (owner only)
 - `..wordstats [@member]`, `..wordleaderboard [word]`
 - `..channel allow|deny|reset`, `..channels`
