@@ -48,8 +48,9 @@ See [.env.example](.env.example) for every common setting. Useful behavior contr
 | `LOG_MESSAGE_CONTENT` | `false` | Opt-in message previews in logs; leave off for privacy |
 | `CONNECT4_SEARCH_DEPTH` | `5` | Connect Four look-ahead depth (`1`–`7`) |
 | `CONNECT4_TIMEOUT_SECONDS` | `1800` | Inactive Connect Four game expiry (`60`–`86400`) |
-| `SYSTEM_PROMPT` | built in | Inline personality override |
-| `SYSTEM_PROMPT_FILE` | unset | UTF-8 file that replaces the built-in personality prompt |
+| `OLLAMA_MAX_RESPONSE_TOKENS` | `500` | Hard cap on a normal chat reply |
+| `SYSTEM_PROMPT` | built in | Inline personality override; output/security rules are always appended |
+| `SYSTEM_PROMPT_FILE` | unset | UTF-8 personality file; output/security rules are always appended |
 
 Invalid numeric or boolean values fail fast at startup instead of silently choosing unsafe behavior.
 
