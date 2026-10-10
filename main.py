@@ -28,6 +28,7 @@ from urllib.parse import urljoin, urlsplit
 
 import aiofiles
 import aiohttp
+import chess
 import chromadb
 import discord
 from chromadb.config import Settings as ChromaSettings
@@ -36,6 +37,11 @@ from discord.ext import commands
 from dotenv import load_dotenv
 from PIL import Image
 
+from heisenbot.chess_game import choose_bot_move as _chess_choose_bot_move
+from heisenbot.chess_game import legal_destinations as _chess_legal_destinations
+from heisenbot.chess_game import legal_origins as _chess_legal_origins
+from heisenbot.chess_game import outcome_text as _chess_outcome_text
+from heisenbot.chess_game import render_board as _chess_render_board
 from heisenbot.config import env_bool, env_float, env_int
 from heisenbot.connect4 import choose_bot_move as _c4_choose_bot_move
 from heisenbot.connect4 import describe_board as _c4_describe_board
@@ -3334,6 +3340,341 @@ async def connect4_cmd(ctx: commands.Context, *, mode: str = ""):
         except (discord.HTTPException, discord.NotFound) as error:
             log_debug(f"[CONNECT4] Failed to update opening move: {error}")
             _c4_games.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
+# Chess: legal-move menus, one edited board message, and a local UCI opponent
+# ---------------------------------------------------------------------------
+CHESS_TIMEOUT_SECONDS = env_int("CHESS_TIMEOUT_SECONDS", 30 * 60, minimum=60, maximum=24 * 60 * 60)
+CHESS_SKILL_LEVEL = env_int("CHESS_SKILL_LEVEL", 3, minimum=0, maximum=20)
+CHESS_THINK_SECONDS = env_float("CHESS_THINK_SECONDS", 0.15, minimum=0.05, maximum=3.0)
+_chess_games: dict[tuple[int, int], dict] = {}
+_chess_engine_sem = asyncio.Semaphore(2)
+
+
+def _chess_is_expired(game: dict) -> bool:
+    return (time.monotonic() - game["last_activity_at"]) > CHESS_TIMEOUT_SECONDS
+
+
+def _chess_content(game: dict, status: str) -> str:
+    human_color = game["human_color"]
+    colors = "White ♔" if human_color == chess.WHITE else "Black ♚"
+    bot_colors = "Black ♚" if human_color == chess.WHITE else "White ♔"
+    parts = [
+        f"**Chess** · You: {colors} · Heisenbot: {bot_colors}",
+        _chess_render_board(game["board"], human_color),
+    ]
+    if game.get("last_move"):
+        parts.append(f"Last move: {game['last_move']}")
+    parts.append(status)
+    return "\n".join(parts)
+
+
+def _chess_view(game: dict, *, disable_all: bool = False) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    board: chess.Board = game["board"]
+    selected = game.get("selected_from")
+    active = not disable_all and game["turn"] == "human"
+
+    origin_options = []
+    if active:
+        for square in _chess_legal_origins(board):
+            piece = board.piece_at(square)
+            if piece is not None:
+                name = chess.square_name(square)
+                origin_options.append(
+                    discord.SelectOption(
+                        label=f"{piece.symbol().upper()} at {name}",
+                        value=name,
+                        description=f"{chess.PIECE_NAMES[piece.piece_type]} on {name}",
+                        default=square == selected,
+                    )
+                )
+    origin_select = discord.ui.Select(
+        placeholder="Choose a piece",
+        options=origin_options or [discord.SelectOption(label="No moves", value="none")],
+        disabled=not active,
+        custom_id="chess_origin",
+        row=0,
+    )
+
+    async def on_origin(interaction: discord.Interaction) -> None:
+        await _chess_handle_origin(interaction, origin_select.values[0])
+
+    origin_select.callback = on_origin
+    view.add_item(origin_select)
+
+    destinations = (
+        _chess_legal_destinations(board, selected) if active and selected is not None else []
+    )
+    for page, offset in enumerate(range(0, max(len(destinations), 1), 25)):
+        page_moves = destinations[offset : offset + 25]
+        options = [
+            discord.SelectOption(
+                label=board.san(move),
+                value=move.uci(),
+                description=f"{chess.square_name(move.from_square)} → {chess.square_name(move.to_square)}",
+            )
+            for move in page_moves
+        ]
+        destination_select = discord.ui.Select(
+            placeholder="Choose a legal move" if page == 0 else "More legal moves",
+            options=options or [discord.SelectOption(label="Pick a piece first", value="none")],
+            disabled=not active or not page_moves,
+            custom_id=f"chess_destination_{page}",
+            row=page + 1,
+        )
+
+        async def on_destination(
+            interaction: discord.Interaction, select: discord.ui.Select = destination_select
+        ) -> None:
+            await _chess_handle_destination(interaction, select.values[0])
+
+        destination_select.callback = on_destination
+        view.add_item(destination_select)
+
+    resign = discord.ui.Button(
+        label="Resign",
+        style=discord.ButtonStyle.danger,
+        custom_id="chess_resign",
+        disabled=disable_all,
+        row=3,
+    )
+    resign.callback = _chess_handle_resign
+    view.add_item(resign)
+    return view
+
+
+async def _chess_get_game(interaction: discord.Interaction) -> tuple[tuple[int, int], dict] | None:
+    key = (interaction.channel_id, interaction.message.id)
+    game = _chess_games.get(key)
+    if game is None:
+        await interaction.response.send_message(
+            f"This game is no longer active. Use `{COMMAND_PREFIX}chess` to start a new one.",
+            ephemeral=True,
+        )
+        return None
+    if _chess_is_expired(game):
+        _chess_games.pop(key, None)
+        await interaction.response.send_message(
+            f"This game has expired. Use `{COMMAND_PREFIX}chess` to start another.",
+            ephemeral=True,
+        )
+        return None
+    if interaction.user.id != game["human_id"]:
+        name = discord.utils.escape_mentions(discord.utils.escape_markdown(game["human_name"]))
+        await interaction.response.send_message(
+            f"This is {name}'s game. Start your own with `{COMMAND_PREFIX}chess`.",
+            ephemeral=True,
+        )
+        return None
+    return key, game
+
+
+async def _chess_handle_origin(interaction: discord.Interaction, origin_name: str) -> None:
+    found = await _chess_get_game(interaction)
+    if found is None:
+        return
+    key, game = found
+    if game["turn"] != "human":
+        await interaction.response.send_message("It's not your turn.", ephemeral=True)
+        return
+    try:
+        origin = chess.parse_square(origin_name)
+    except ValueError:
+        await interaction.response.send_message("Choose a valid piece.", ephemeral=True)
+        return
+    if origin not in _chess_legal_origins(game["board"]):
+        await interaction.response.send_message("That piece has no legal moves.", ephemeral=True)
+        return
+    try:
+        await interaction.response.defer(thinking=False)
+        game["selected_from"] = origin
+        game["last_activity_at"] = time.monotonic()
+        await interaction.edit_original_response(
+            content=_chess_content(game, f"**Your turn.** Choose a destination for {origin_name}."),
+            view=_chess_view(game),
+        )
+    except (discord.HTTPException, discord.NotFound) as error:
+        log_debug(f"[CHESS] Failed to select piece: {error}")
+        _chess_games.pop(key, None)
+
+
+async def _chess_play_bot(game: dict) -> str | None:
+    board: chess.Board = game["board"]
+    async with _chess_engine_sem:
+        move = await asyncio.to_thread(
+            _chess_choose_bot_move,
+            board.copy(),
+            skill_level=CHESS_SKILL_LEVEL,
+            think_seconds=CHESS_THINK_SECONDS,
+        )
+    if move not in board.legal_moves:
+        log("[CHESS] Engine returned no legal move")
+        return None
+    san = board.san(move)
+    board.push(move)
+    game["last_move"] = f"Heisenbot {san}"
+    game["last_activity_at"] = time.monotonic()
+    return san
+
+
+async def _chess_handle_destination(interaction: discord.Interaction, move_uci: str) -> None:
+    found = await _chess_get_game(interaction)
+    if found is None:
+        return
+    key, game = found
+    if game["turn"] != "human":
+        await interaction.response.send_message("It's not your turn.", ephemeral=True)
+        return
+    try:
+        move = chess.Move.from_uci(move_uci)
+    except ValueError:
+        await interaction.response.send_message("Choose a legal destination.", ephemeral=True)
+        return
+    board: chess.Board = game["board"]
+    if move.from_square != game.get("selected_from") or move not in board.legal_moves:
+        await interaction.response.send_message("That move is no longer available.", ephemeral=True)
+        return
+
+    # Claim the turn before yielding so rapid clicks cannot apply multiple moves.
+    game["turn"] = "bot"
+    try:
+        await interaction.response.defer(thinking=False)
+    except (discord.HTTPException, discord.NotFound) as error:
+        game["turn"] = "human"
+        log_debug(f"[CHESS] Failed to acknowledge move: {error}")
+        return
+    san = board.san(move)
+    board.push(move)
+    game["selected_from"] = None
+    game["last_move"] = f"You {san}"
+    game["last_activity_at"] = time.monotonic()
+    outcome = _chess_outcome_text(board, game["human_color"])
+    if outcome is not None:
+        _chess_games.pop(key, None)
+        with contextlib.suppress(discord.HTTPException, discord.NotFound):
+            await interaction.edit_original_response(
+                content=_chess_content(game, outcome), view=_chess_view(game, disable_all=True)
+            )
+        return
+
+    try:
+        await interaction.edit_original_response(
+            content=_chess_content(game, "**Heisenbot's turn…**"),
+            view=_chess_view(game, disable_all=True),
+        )
+    except (discord.HTTPException, discord.NotFound) as error:
+        log_debug(f"[CHESS] Failed to show bot turn: {error}")
+        _chess_games.pop(key, None)
+        return
+
+    bot_san = await _chess_play_bot(game)
+    if _chess_games.get(key) is not game:
+        return
+    if bot_san is None:
+        _chess_games.pop(key, None)
+        status = "**Engine unavailable. Start a new game.**"
+    else:
+        outcome = _chess_outcome_text(board, game["human_color"])
+        if outcome is not None:
+            _chess_games.pop(key, None)
+            status = outcome
+        else:
+            game["turn"] = "human"
+            status = "**Your turn.** Choose a piece."
+    try:
+        await interaction.edit_original_response(
+            content=_chess_content(game, status),
+            view=_chess_view(game, disable_all=key not in _chess_games),
+        )
+    except (discord.HTTPException, discord.NotFound) as error:
+        log_debug(f"[CHESS] Failed to update board: {error}")
+        _chess_games.pop(key, None)
+
+
+async def _chess_handle_resign(interaction: discord.Interaction) -> None:
+    found = await _chess_get_game(interaction)
+    if found is None:
+        return
+    key, game = found
+    if game["turn"] != "human":
+        await interaction.response.send_message("Wait for my move to finish.", ephemeral=True)
+        return
+    game["turn"] = "finished"
+    _chess_games.pop(key, None)
+    try:
+        await interaction.response.defer(thinking=False)
+        await interaction.edit_original_response(
+            content=_chess_content(game, "**You resigned. Heisenbot wins.**"),
+            view=_chess_view(game, disable_all=True),
+        )
+    except (discord.HTTPException, discord.NotFound) as error:
+        log_debug(f"[CHESS] Failed to show resignation: {error}")
+
+
+@bot.command(name="chess")
+@commands.guild_only()
+@commands.cooldown(1, 5, commands.BucketType.user)
+@commands.max_concurrency(1, per=commands.BucketType.channel, wait=False)
+async def chess_cmd(ctx: commands.Context, *, mode: str = "") -> None:
+    """Start chess. Use ``..chess black`` to play Black against Heisenbot."""
+    normalized = mode.strip().lower()
+    if normalized not in {"", "white", "black", "botfirst"}:
+        await ctx.send(f"Usage: `{COMMAND_PREFIX}chess [white|black]`")
+        return
+    channel_id = ctx.channel.id
+    for key, existing in tuple(_chess_games.items()):
+        if _chess_is_expired(existing):
+            _chess_games.pop(key, None)
+    active = next((game for key, game in _chess_games.items() if key[0] == channel_id), None)
+    if active and active["human_id"] != ctx.author.id:
+        name = discord.utils.escape_mentions(discord.utils.escape_markdown(active["human_name"]))
+        await ctx.send(f"{name} already has an active chess game here.")
+        return
+    for key in [key for key in _chess_games if key[0] == channel_id]:
+        _chess_games.pop(key, None)
+
+    human_color = chess.BLACK if normalized in {"black", "botfirst"} else chess.WHITE
+    game = {
+        "board": chess.Board(),
+        "turn": "bot" if human_color == chess.BLACK else "human",
+        "human_color": human_color,
+        "human_id": ctx.author.id,
+        "human_name": ctx.author.display_name,
+        "selected_from": None,
+        "last_move": "",
+        "last_activity_at": time.monotonic(),
+    }
+    message = await ctx.send(
+        _chess_content(
+            game,
+            "**Heisenbot's turn…**"
+            if human_color == chess.BLACK
+            else "**Your turn.** Choose a piece, then a destination.",
+        ),
+        view=_chess_view(game, disable_all=human_color == chess.BLACK),
+    )
+    key = (channel_id, message.id)
+    _chess_games[key] = game
+    if human_color == chess.BLACK:
+        bot_san = await _chess_play_bot(game)
+        if _chess_games.get(key) is not game:
+            return
+        if bot_san is None:
+            _chess_games.pop(key, None)
+            status = "**Engine unavailable. Start a new game.**"
+        else:
+            game["turn"] = "human"
+            status = "**Your turn.** Choose a piece, then a destination."
+        try:
+            await message.edit(
+                content=_chess_content(game, status),
+                view=_chess_view(game, disable_all=key not in _chess_games),
+            )
+        except (discord.HTTPException, discord.NotFound) as error:
+            log_debug(f"[CHESS] Failed to show opening move: {error}")
+            _chess_games.pop(key, None)
 
 
 @bot.command(name="context", aliases=["ctx"])

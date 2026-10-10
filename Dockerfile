@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends fonts-liberation \
+    && apt-get install -y --no-install-recommends fonts-liberation stockfish \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 heisenbot \
     && useradd --uid 1000 --gid heisenbot --create-home --shell /usr/sbin/nologin heisenbot

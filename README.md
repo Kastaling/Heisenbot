@@ -48,6 +48,9 @@ See [.env.example](.env.example) for every common setting. Useful behavior contr
 | `LOG_MESSAGE_CONTENT` | `false` | Opt-in message previews in logs; leave off for privacy |
 | `CONNECT4_SEARCH_DEPTH` | `5` | Connect Four look-ahead depth (`1`–`7`) |
 | `CONNECT4_TIMEOUT_SECONDS` | `1800` | Inactive Connect Four game expiry (`60`–`86400`) |
+| `CHESS_TIMEOUT_SECONDS` | `1800` | Inactive chess game expiry (`60`–`86400`) |
+| `CHESS_SKILL_LEVEL` | `3` | Stockfish difficulty (`0`–`20`) |
+| `CHESS_THINK_SECONDS` | `0.15` | Maximum Stockfish search time per move (`0.05`–`3`) |
 | `OLLAMA_MAX_RESPONSE_TOKENS` | `500` | Hard cap on a normal chat reply |
 | `SYSTEM_PROMPT` | built in | Inline personality override; output/security rules are always appended |
 | `SYSTEM_PROMPT_FILE` | unset | UTF-8 personality file; output/security rules are always appended |
@@ -77,10 +80,12 @@ Heisenbot stores message text, Discord user IDs/display names, channel metadata,
 - `..leaderboard [timespan]` — cross-server leaderboard (owner only)
 - `..wordstats [@member]`, `..wordleaderboard [word]`
 - `..channel allow|deny|reset`, `..channels`
-- `..tictactoe`, `..connect4 [botfirst]`, `..getcaptioned`, `..poster`, `..rage`
+- `..tictactoe`, `..connect4 [botfirst]`, `..chess [white|black]`, `..getcaptioned`, `..poster`, `..rage`
 - `..gpu` — owner-only NVIDIA status
 
 Use Discord channel permissions as the primary access boundary. Heisenbot now skips reply generation when it lacks `Send Messages`, avoiding expensive work followed by a Discord 403.
+
+Chess uses a piece dropdown followed by a legal move dropdown. The board is shown from your side; `..chess black` lets Heisenbot move first. Castling, en passant, promotion, checkmate, and standard automatic/claimable draws are handled by `python-chess`. The packaged Stockfish engine plays locally with a short search time and uses no Ollama tokens or GPU memory. Chess games are held in memory, so a bot restart ends active games.
 
 ## Development
 
