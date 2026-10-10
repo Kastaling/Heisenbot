@@ -5,6 +5,7 @@ from heisenbot.chess_game import (
     fallback_move,
     legal_destinations,
     legal_origins,
+    notable_move,
     outcome_text,
     render_board,
 )
@@ -45,6 +46,16 @@ def test_checkmate_and_draw_outcomes():
     assert outcome_text(mate, chess.WHITE) == "**Heisenbot wins by checkmate!**"
     stalemate = chess.Board("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1")
     assert outcome_text(stalemate, chess.WHITE) == "**Draw by stalemate.**"
+
+
+def test_comment_events_only_for_major_captures_and_promotions():
+    board = chess.Board("4k3/8/8/3q4/3R4/8/8/4K3 w - - 0 1")
+    assert notable_move(board, chess.Move.from_uci("d4d5"), "you") == "you captured a queen"
+    assert notable_move(chess.Board(), chess.Move.from_uci("e2e4"), "you") is None
+    promotion = chess.Board("1r2k3/P7/8/8/8/8/8/4K3 w - - 0 1")
+    assert notable_move(promotion, chess.Move.from_uci("a7b8q"), "you") == (
+        "you captured a rook; you promoted a pawn to a queen"
+    )
 
 
 def test_engine_failure_keeps_move_legal_and_does_not_mutate_board():

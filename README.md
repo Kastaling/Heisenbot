@@ -85,7 +85,7 @@ Heisenbot stores message text, Discord user IDs/display names, channel metadata,
 
 Use Discord channel permissions as the primary access boundary. Heisenbot now skips reply generation when it lacks `Send Messages`, avoiding expensive work followed by a Discord 403.
 
-Chess uses a piece dropdown followed by a legal move dropdown. The board is shown from your side; `..chess black` lets Heisenbot move first. Castling, en passant, promotion, checkmate, and standard automatic/claimable draws are handled by `python-chess`. The packaged Stockfish engine plays locally with a short search time and uses no Ollama tokens or GPU memory. Chess games are held in memory, so a bot restart ends active games.
+Chess uses a piece dropdown followed by a legal move dropdown. The board is shown from your side; `..chess black` lets Heisenbot move first. Castling, en passant, promotion, checkmate, and standard automatic/claimable draws are handled by `python-chess`. The packaged Stockfish engine chooses moves locally without Ollama or GPU memory. Ollama only posts a short comment after a queen/rook capture, promotion, resignation, or game result; it never chooses chess moves. Chess games are held in memory, so a bot restart ends active games.
 
 ## Development
 

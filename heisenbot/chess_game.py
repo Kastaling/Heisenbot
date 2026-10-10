@@ -64,6 +64,17 @@ def legal_destinations(board: chess.Board, origin: chess.Square) -> list[chess.M
     )
 
 
+def notable_move(board: chess.Board, move: chess.Move, actor: str) -> str | None:
+    """Describe a major capture or promotion before the move is pushed."""
+    events = []
+    captured = board.piece_at(move.to_square)
+    if captured and captured.piece_type in {chess.QUEEN, chess.ROOK}:
+        events.append(f"{actor} captured a {PIECE_NAMES[captured.piece_type].lower()}")
+    if move.promotion:
+        events.append(f"{actor} promoted a pawn to a {PIECE_NAMES[move.promotion].lower()}")
+    return "; ".join(events) or None
+
+
 def fallback_move(board: chess.Board) -> chess.Move | None:
     """Select a legal tactical move if the installed engine is unavailable."""
     moves = list(board.legal_moves)
