@@ -6,6 +6,6 @@ chess==1.11.2
 ddgs==9.16.1
 discord.py==2.7.1
 ollama==0.6.3
-opencv-python-headless==5.0.0.93
+opencv-python-headless==5.1.0.95
 Pillow==13.0.0
 python-dotenv==1.2.4
